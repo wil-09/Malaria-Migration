@@ -1,0 +1,244 @@
+function OptCon_Feb26
+    % =====================================================================
+    clc; clear; close all;
+
+    % --- 1. PARAMETERS ---
+    p.Lambda_h = 0.547;   p.Lambda_v = 476.19;
+    p.mu_h     = 5.48e-5; p.mu_v     = 0.071;  p.epsilon  = 0.70;
+    p.delta_v  = 0.25;    p.theta    = 1e-5;   p.gamma    = 0.25;
+    p.b        = 0.195;   p.c        = 0.4;    p.a        = 0.205;
+
+    % Migration (fixed except nu_12)
+    p.m_12     = 0.01;  p.m_21     = 0.9;
+    p.sigma_12 = 0.9;  p.sigma_21 = 0.9;
+    p.nu_12    = 0.9;   p.nu_21    = 0;
+
+%     p.m_12 = 0.01; p.m_21 = 0.3;
+%     p.sigma_12 = 0.01; p.sigma_21 = 0.9;
+%     p.nu_21 = 0; p.nu_12 = 0.1;
+    
+    % Weights
+    p.A1 = 100; p.A2 = 100;
+    p.B1 = 50;  p.B2 = 50;  p.B3 = 50;
+
+    % Time
+    T = 90; Nt = 1000;
+
+    % === Compare different nu_12 values ===
+    nu_values = [0.01, 0.3, 0.9];
+%     Lambda_v_values = [0.05, 100, 300];
+    colors = {'r-', 'b--', 'g:'}; % line styles for distinction
+
+    figure;
+    set(gcf, 'Color', 'w');
+
+    for k = 1:length(nu_values)
+        p.nu_12 = nu_values(k);
+%     for    k = 1:length(Lambda_v_values)
+%         p.Lambda_v = Lambda_v_values(k);
+
+        % Run one scenario (e.g., full optimization case 4)
+        [t, x, u] = solve_scenario(p, T, Nt, 3);
+
+        % Compute totals
+        IH_total = x(2,:) + x(6,:);
+        IV_total = x(4,:) + x(8,:);
+
+        % Plot infected humans
+        subplot(2,1,1); hold on;
+        plot(t, IH_total, colors{k}, 'LineWidth', 2.2);
+        xlabel('Time (days)'); ylabel('Infected humans'); grid off;
+
+        % Plot infected vectors
+        subplot(2,1,2); hold on;
+        plot(t, IV_total, colors{k}, 'LineWidth', 2.2);
+        xlabel('Time (days)'); ylabel('Infected vectors'); grid off;
+    end
+
+    % Add legends
+    subplot(2,1,1);
+    legend({'\nu_{12}=0.01','\nu_{12}=0.3','\nu_{12}=0.5'}, 'Location','Best');
+%     legend({'\Lambda_{V} = 0.01','\Lambda_{V} = 100', '\Lambda_{V} = 500'}, 'Location','Best');
+    subplot(2,1,2);
+    legend({'\nu_{12}=0.01','\nu_{12}=0.3','\nu_{12}=0.5'}, 'Location','Best');
+%     legend({'\Lambda_{V} = 0.01','\Lambda_{V} = 100', '\Lambda_{V} = 500'}, 'Location','Best');
+end
+
+% =========================================================================
+% PLOTTING
+% =========================================================================
+function create_control_plot(t, u, title_text, fig_num)
+    figure(fig_num);
+    set(gcf, 'Color', 'w'); % White background
+
+    % Plot the 3 controls
+    plot(t, u(1,:), 'r-', 'LineWidth', 2.5); hold on;
+    plot(t, u(2,:), 'b--', 'LineWidth', 2.5); hold on
+    plot(t, u(3,:), 'g:', 'LineWidth', 2.5); grid off;
+    set(gca, 'Color', 'w', 'XColor', 'k', 'YColor', 'k', 'GridColor', 'k', 'GridAlpha', 0.2);
+
+    % Labels
+    title(title_text, 'Interpreter', 'latex', 'FontSize', 14, 'Color', 'k', 'FontWeight', 'bold');
+    xlabel('Time (days)', 'FontSize', 12, 'Color', 'k', 'FontWeight', 'bold');
+    ylabel('Control Effort', 'FontSize', 12, 'Color', 'k', 'FontWeight', 'bold');
+    ylim([0 1.05]);
+
+    % Legend
+    lgd = legend({'$u_1$ (Repellency)', '$u_2$ (Contact Red.)', '$u_3$ (Lethality)'}, ...
+                 'Interpreter', 'latex', 'Location', 'Best');
+    set(lgd, 'Color', 'w', 'TextColor', 'k', 'FontSize', 11);
+end
+
+% =========================================================================
+% INFECTION PLOTTING
+% =========================================================================
+function create_infection_plot(t, x, title_text, fig_num)
+    % x layout: [SH1; IH1; SV1; IV1; SH2; IH2; SV2; IV2]
+    IH_total = x(2,:) + x(6,:); % IH1 + IH2
+    IV_total = x(4,:) + x(8,:); % IV1 + IV2
+
+    figure(fig_num + 10);
+    set(gcf, 'Color', 'w');
+
+    subplot(2,1,1);
+    plot(t, IH_total, 'm-', 'LineWidth', 2.5);
+    grid on;
+    title(['Total Infected Humans' title_text], 'Interpreter', 'latex', 'FontSize', 13, 'FontWeight', 'bold');
+    xlabel('Time (days)', 'FontSize', 11); ylabel('Infected humans', 'FontSize', 11);
+
+    subplot(2,1,2);
+    plot(t, IV_total, 'c-', 'LineWidth', 2.5);
+    grid on;
+    title(['Total Infected Vectors' title_text], 'Interpreter', 'latex', 'FontSize', 13, 'FontWeight', 'bold');
+    xlabel('Time (days)', 'FontSize', 11); ylabel('Infected vectors', 'FontSize', 11);
+
+    % Tighten layout a bit
+    set(findall(gcf,'-property','FontSize'),'FontSize',11)
+end
+
+% =========================================================================
+% COMBINED SCENARIO PLOT (controls + solutions)
+% =========================================================================
+function create_scenario_figure(t, u, x, title_text, fig_num)
+    % x layout: [SH1; IH1; SV1; IV1; SH2; IH2; SV2; IV2]
+    IH_total = x(2,:) + x(6,:); % IH1 + IH2
+    IV_total = x(4,:) + x(8,:); % IV1 + IV2
+
+    figure(fig_num);
+    set(gcf, 'Color', 'w');
+
+    % Top: controls
+    subplot(2,1,1);
+    plot(t, u(1,:), 'r-', 'LineWidth', 2.5); hold on;
+    plot(t, u(2,:), 'b--', 'LineWidth', 2.5);
+    plot(t, u(3,:), 'g:', 'LineWidth', 2.5); grid off; % hold off;
+    title(['Controls' title_text], 'Interpreter', 'latex', 'FontSize', 14, 'FontWeight', 'bold');
+    xlabel('Time (days)', 'FontSize', 12); ylabel('Control Effort', 'FontSize', 12); ylim([0 1.05]);
+    lgd = legend({'$u_1$ (Repellency)', '$u_2$ (Migration Red.)', '$u_3$ (Lethality)'}, 'Interpreter', 'latex', 'Location', 'Best');
+    set(lgd, 'Color', 'w', 'TextColor', 'k', 'FontSize', 11);
+
+    % Bottom: solutions (IH_total and IV_total)
+    subplot(2,1,2);
+    yyaxis left
+    plot(t, IH_total, 'm-', 'LineWidth', 2.2);
+    ylabel('Total infected humans', 'FontSize', 11);
+    yyaxis right
+    plot(t, IV_total, 'c-', 'LineWidth', 2.2);
+    ylabel('Total infected vectors', 'FontSize', 11);
+    grid on;
+    xlabel('Time (days)', 'FontSize', 12);
+    title(['Total infections' title_text], 'Interpreter', 'latex', 'FontSize', 13, 'FontWeight', 'bold');
+    legend({'IH_{total}', 'IV_{total}'}, 'Location', 'Best');
+
+    set(findall(gcf,'-property','FontSize'),'FontSize',11)
+end
+
+% =========================================================================
+% SOLVER FUNCTION
+% =========================================================================
+function [t, x, u] = solve_scenario(p, T, Nt, scenario)
+    dt = T/Nt; t = linspace(0, T, Nt+1);
+    x = zeros(8,Nt+1); x(:,1) = [1000; 200; 10000; 1000; 1000; 100; 8000; 500];
+    lambda = zeros(8,Nt+1); u = zeros(3,Nt+1);
+    max_iter = 1000; tol = 0.001; test = 1; iter = 0;
+
+    while(test > tol && iter < max_iter)
+        iter = iter + 1; old_u = u;
+        for i = 1:Nt
+            u1 = u(1,i); u2 = u(2,i); u3 = u(3,i);
+            SH1 = x(1,i); IH1 = x(2,i); SV1 = x(3,i); IV1 = x(4,i);
+            SH2 = x(5,i); IH2 = x(6,i); SV2 = x(7,i); IV2 = x(8,i);
+            NH1 = SH1 + IH1; NH2 = SH2 + IH2;
+            lam_H1 = (p.a*p.b*IV1)*(1 - p.epsilon)/NH1; lam_V1 = (p.a*p.c*IH1)/NH1;
+            lam_H2 = (p.a*p.b*IV2)/NH2; lam_V2 = (p.a*p.c*IH2)/NH2;
+
+            dSH1 = p.Lambda_h -(1 - u1)*lam_H1*SH1 - (p.mu_h + p.m_12)*SH1 + p.gamma*IH1 + p.m_21*SH2;
+            dIH1 = (1 - u1)*lam_H1*SH1 - (p.gamma + p.mu_h + p.theta + p.sigma_12)*IH1 + (p.sigma_21 - u2)*IH2;
+            dSV1 = p.Lambda_v - (1 - u1)*lam_V1*SV1 - (p.mu_v + p.delta_v + p.nu_12 + u3)*SV1;
+            dIV1 = (1 - u1)*lam_V1*SV1 - (p.mu_v + p.delta_v + p.nu_12 + u3)*IV1;
+            dSH2 = p.Lambda_h - lam_H2*SH2 - (p.mu_h + p.m_21)*SH2 + p.gamma*IH2 + p.m_12*SH1;
+            dIH2 = lam_H2*SH2 - (p.gamma + p.mu_h + p.theta + p.sigma_21 - u2)*IH2 + p.sigma_12*IH1;
+            dSV2 = p.Lambda_v - lam_V2*SV2 - (p.mu_v + p.nu_21)*SV2 + p.nu_12*SV1;
+            dIV2 = lam_V2*SV2 - (p.mu_v + p.nu_21)*IV2 + p.nu_12*IV1;
+            x(:,i+1) = x(:,i) + dt*[dSH1; dIH1; dSV1; dIV1; dSH2; dIH2; dSV2; dIV2];
+        end
+        lambda(:, Nt+1) = zeros(8,1);
+        for i = Nt:-1:1
+            SH1 = x(1,i+1); IH1 = x(2,i+1); SV1 = x(3,i+1); IV1 = x(4,i+1);
+            SH2 = x(5,i+1); IH2 = x(6,i+1); SV2 = x(7,i+1); IV2 = x(8,i+1);
+%             NH1 = SH1 + IH1; NH2 = SH2 + IH2; 
+            u1 = u(1,i); u2 = u(2,i); u3 = u(3,i); L = lambda(:,i+1);
+
+            dH_dSH1 = (-1 + u1)*(p.a*p.b*(1 - p.epsilon)*(L(2) - L(1))*IV1 - SV1*p.a*p.c*(L(4) - L(3)))*IH1/(SH1 + IH1)^2 - L(1)*(-p.mu_h - p.m_12) - L(5)*p.m_12;
+            dH_dIH1 = -SH1*(p.a*p.b*(1 - p.epsilon)*(L(2) - L(1))*IV1 - SV1*p.a*p.c*(L(4) - L(3)))*(-1 + u1)/(SH1 + IH1)^2 - p.A1 - L(1)*p.gamma - (-(p.mu_h + p.gamma + p.theta) - p.sigma_12)*L(2) - L(6)*p.sigma_12;
+            dH_dSV1 = p.a*p.c*(-1 + u1)*IH1*(L(4) - L(3))/(SH1 + IH1) - L(3)*(-p.mu_v - p.delta_v - p.nu_12 - u3) - L(7)*p.nu_12;
+            dH_dIV1 = p.a*p.b*(1 - p.epsilon)*(-1 + u1)*SH1*(L(2) - L(1))/(SH1 + IH1) - p.A2 - L(4)*(-p.mu_v - p.delta_v - p.nu_12 - u3) - L(8)*p.nu_12;
+            
+            dH_dSH2 = -IH2*(IV2*p.a*p.b*(L(6) - L(5)) - SV2*p.a*p.c*(L(8) - L(7)))/(SH2 + IH2)^2 - L(1)*p.m_21 - (-p.m_21 - p.mu_h)*L(5);
+            dH_dIH2 = (IV2*p.a*p.b*(L(6) - L(5)) - SV2*p.a*p.c*(L(8) - L(7)))*SH2/(SH2 + IH2)^2 - L(5)*p.gamma - L(2)*(p.sigma_21 - u2) - L(6)*(-p.mu_h - p.gamma - p.theta - p.sigma_21 + u2);
+            dH_dSV2 = -p.a*p.c*IH2*(L(8) - L(7))/(SH2 + IH2) + L(7)*p.mu_v;
+            dH_dIV2 = -SH2*p.a*p.b*(L(6) - L(5))/(SH2 + IH2) + L(8)*p.mu_v;
+            lambda(:,i) = L + dt*[dH_dSH1; dH_dIH1; dH_dSV1; dH_dIV1; dH_dSH2; dH_dIH2; dH_dSV2; dH_dIV2];
+        end
+        u_new = zeros(3, Nt+1);
+        for i = 1:Nt+1
+            SH1 = x(1,i); IH1 = x(2,i); SV1 = x(3,i); IV1 = x(4,i); NH1 = SH1 + IH1;
+            L_SH1 = lambda(1,i); L_IH1 = lambda(2,i); L_SV1 = lambda(3,i); L_IV1 = lambda(4,i);
+            L_IH2 = lambda(6,i); % L_SH2 = lambda(5,i); L_SV2 = lambda(7,i); L_IV2 = lambda(8,i);
+            
+            s1 = (L_IH1 - L_SH1) * p.a*p.b*IV1*SH1*(1 - p.epsilon)/(p.B1*NH1) + ...
+                (L_IV1 - L_SV1) * p.a*p.c*IH1*SV1/(p.B1*NH1);
+            s2 = (L_IH1 - L_IH2) * IH2/(p.B2*NH1);
+            s3 = (L_SV1*SV1 + L_IV1*IV1) / p.B3;
+
+%             if scenario == 1, val = (L_IH1 - L_SH1) * p.a*p.b*IV1*SH1*(1 - p.epsilon)/(p.B1*NH1) + ...
+%                 (L_IV1 - L_SV1) * p.a*p.c*IH1*SV1/(p.B1*NH1); 
+%             
+%             if scenario == 1
+%                 u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = 0;
+%             elseif scenario == 2 
+%                 u_new(1,i) = 0; u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = min(1,max(0,s3));
+%             elseif scenario == 3 
+%                 u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = 0; u_new(3,i) = min(1,max(0,s3));
+%             else 
+%                 u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = min(1,max(0,s3)); 
+%             end
+            
+            if scenario == 1
+                u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = u_new(1,i); u_new(3,i) = min(1,max(0,s3));
+            elseif scenario == 2 
+                u_new(1,i) = 0; u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = min(1,max(0,s3));
+            elseif scenario == 3 
+                u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = 0; u_new(3,i) = min(1,max(0,s3));
+            elseif scenario == 4
+                u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = 0;
+            elseif scenario == 5
+                u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = u_new(1,i);
+            else
+                u_new(1,i) = min(1,max(0,s1)); u_new(2,i) = min(1,max(0,s2)); u_new(3,i) = min(1,max(0,s3)); 
+            end
+        end
+        u = 0.5*u_new + 0.5*old_u;
+        test = max(abs(u(:) - old_u(:))) / (1 + norm(u(:)));
+    end
+end
