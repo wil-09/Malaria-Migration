@@ -29,7 +29,7 @@ print(f"Using device: {device}")
 # ---------------------------
 # Random graph builder (Erdős-Rényi with min-degree guarantee)
 # ---------------------------
-def random_adj(n: int, p: float = 0.1, seed: int = None, min_degree: int = 3) -> np.ndarray:
+def random_adj(n: int, p: float = 0.103, seed: int = None, min_degree: int = 3) -> np.ndarray:
     rng = np.random.RandomState(seed)
     A = (rng.rand(n, n) < p).astype(float)
     A = np.triu(A, 1)
@@ -49,17 +49,17 @@ def random_adj(n: int, p: float = 0.1, seed: int = None, min_degree: int = 3) ->
 # Build graph and normalized random-walk matrices
 # ---------------------------
 N_nodes = 30
-A = random_adj(N_nodes, p=0.08, seed=1)
+A = random_adj(N_nodes, p=0.103, seed=1)
 G = nx.from_numpy_array(A)
 
 deg   = A.sum(axis=1)                          # (N,) node degrees
 P     = A / deg[:, np.newaxis]                 # (N, N)  P_ij = A_ij / d_i  (row-stochastic)
 
 # Diffusion scalars per compartment
-c_Sh = 5.0   # for S_h
-c_Ih = 5.0  # for I_h
-c_Sv = 1.0  # for S_v
-c_Iv = 1.0  # for I_v
+c_Sh = 1.0   # for S_h
+c_Ih = 1.0   # for I_h
+c_Sv = 0.0  # for S_v
+c_Iv = 0.0  # for I_v
 
 # Movement rate matrices  M_ij = c * P_ij  (normalized by source degree)
 M_sh     = c_Sh * P
@@ -86,16 +86,19 @@ print(f"\n  Row-sum of P (should all be 1): min={P.sum(axis=1).min():.6f}, "
 # ---------------------------
 # Model parameters (per-node vectors)
 # ---------------------------
-beta_h  = np.full(N_nodes, 0.27,    dtype=np.float32)
-beta_v  = np.full(N_nodes, 0.64,     dtype=np.float32)
+beta_h  = np.full(N_nodes, 0.022,    dtype=np.float32)
+beta_v  = np.full(N_nodes, 0.48,     dtype=np.float32)
 mu_h    = np.full(N_nodes, 0.000016,    dtype=np.float32)   # human death rate
-Lambda_h = np.full(N_nodes, 0.27,   dtype=np.float32)
-Lambda_v = np.full(N_nodes, 0.27,    dtype=np.float32)
+Lambda_h = np.full(N_nodes, 0.033,   dtype=np.float32)
+Lambda_v = np.full(N_nodes, 0.13,    dtype=np.float32)
 gamma   = 0.000055
-theta   = 0.000009
+theta   = 0.00009
 mu_v    = 0.033
 delta_v = 0.0025   # vector extra mortality
 
+eps = 1e-12
+d = mu_h + gamma + theta                     # (N,)
+beta_h = (1.0 + 10.0) * d * (mu_v + delta_v)**2 * Lambda_h / (beta_v * mu_h * Lambda_v + eps)
 # torch tensors
 beta_h_t   = torch.tensor(beta_h,   dtype=torch.float32, device=device)
 beta_v_t   = torch.tensor(beta_v,   dtype=torch.float32, device=device)
@@ -112,38 +115,35 @@ delta_v_t  = torch.tensor(float(delta_v), dtype=torch.float32, device=device)
 # ---------------------------
 # Formulas provided by the user; vectorized implementation with safeguards.
 
-eps = 1e-12
+# eps = 1e-12
 
-# scalar mu (vector for consistency with vectorized ops)
-mu = mu_v + delta_v                          # scalar
-# d is vector (depends on mu_h)
-d = mu_h + gamma + theta                     # (N,)
+mu = mu_v + delta_v                          # # scalar mu (vector for consistency with vectorized ops)# scalar
+# d = mu_h + gamma + theta                   # # d is vector (depends on mu_h) # (N,)
+# beta_h = (1 + 0.01) * d * (mu_v + delta_v)**2 * Lambda_h / (beta_v * mu_h * Lambda_v + eps)
 
 # compute b (vectorized)
-# b = d*(beta_v*beta_h*(mu_h + theta)/d - 2*mu^2*Lambda_h - mu*Lambda_h*beta_v );
 b = d * ( (beta_v * beta_h * (mu_h + theta) / (d + eps)) - 2.0 * (mu**2) * Lambda_h - mu * Lambda_h * beta_v )
 
 # R02 (per-node)
-# R02 = beta_h*beta_v*mu_h*Lambda_v/((mu_h + gamma + theta)*(mu_v + delta_v)^2*Lambda_h);
 R02 = (beta_h * beta_v * mu_h * Lambda_v) / ( (mu_h + gamma + theta) * (mu + eps)**2 * Lambda_h + eps )
 
 # discriminant for lambda_h
-disc = b**2 - 4.0 * (mu**3) * (d**2) * (Lambda_h**2) * (1.0 - R02) * (mu + beta_v)
+disc = b**2 - 4.0 * mu**3 * d**2 * Lambda_h**2 * (1.0 - R02) * (mu + beta_v)
 disc = np.maximum(disc, 0.0)   # clamp negative numerical noise
 
 # lambda_h (choose the root with + sqrt as in user's formula)
 den_lambda_h = 2.0 * mu * Lambda_h * (mu + beta_v) + eps
 lambda_h  = (b + np.sqrt(disc)) / den_lambda_h
-lambda_hp = (b - np.sqrt(disc)) / den_lambda_h
+# lambda_h = (b - np.sqrt(disc)) / den_lambda_h
 
 # lambda_v
 lambda_v = beta_v * lambda_h / (d + lambda_h + eps)
 
 # Now compute steady-state compartments (vectorized)
 S_h = Lambda_h / (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps)
-I_h = (lambda_h * Lambda_h) / ( (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps) * (d + eps) )
+I_h = lambda_h * Lambda_h / ( (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps) * (d + eps) )
 S_v = Lambda_v / (mu + lambda_v + eps)
-I_v = (Lambda_v * lambda_v) / (mu * (mu + lambda_v + eps) + eps)
+I_v = Lambda_v * lambda_v / (mu * (mu + lambda_v + eps) + eps)
 
 # Replace any tiny negative numerical artifacts with zero
 S_h = np.maximum(S_h, 0.0)
@@ -151,20 +151,22 @@ I_h = np.maximum(I_h, 0.0)
 S_v = np.maximum(S_v, 0.0)
 I_v = np.maximum(I_v, 0.0)
 
-# Build the initial condition array used by the PINN (shape (N,4))
-y0_full = np.stack([S_h, I_h, S_v, I_v], axis=1).astype(np.float32)
+# Snapshot of all-node EE values — used only for var_scales below.
+# The actual PINN initial condition (y0_full) is built further down
+# with infecteds seeded at one node only.
+ee_snapshot = np.stack([S_h, I_h, S_v, I_v], axis=1).astype(np.float32)
 
 # Update R0 summary using R02 (per-node). Use mean for scalar summary, but print min/max.
 R0 = float(np.mean(R02))
 print(f"\nR0 (from R02 formula) mean ≈ {R0:.3f}  (per-node R02: min={float(np.min(R02)):.3f}, max={float(np.max(R02)):.3f})")
-print("Seed node initial S_h,I_h,S_v,I_v:", y0_full[0])
+print("EE compartments (uniform across nodes):", ee_snapshot[0])
 
 # ---------------------------
 # Characteristic scales for loss normalization
 # ---------------------------
-# Use per-node EE values (already in y0_full) so scales are consistent with
-# the initial condition.  A small floor avoids division by zero for nodes
-# whose EE infected compartment is numerically zero (e.g. R0 < 1 nodes).
+# Use the EE compartment values as normalization scales for the ODE residual.
+# These are the natural magnitudes of each state variable at steady state.
+# A small floor avoids division by zero (e.g. if a compartment is near zero).
 _min_I_scale = 1e-3   # floor for infected compartments
 var_scales = np.stack([np.maximum(S_h, eps),
                        np.maximum(I_h, _min_I_scale),
@@ -175,7 +177,8 @@ var_scales = np.stack([np.maximum(S_h, eps),
 # PINN network
 # ---------------------------
 class PINNNet(nn.Module):
-    def __init__(self, n_nodes: int, hidden=(128, 128), T_final: float = 200.0):
+    def __init__(self, n_nodes: int, hidden=(128, 128), T_final: float = 200.0,
+                 y0_anchor: np.ndarray = None):
         super().__init__()
         self.n_nodes = n_nodes
         self.T_final = float(T_final)
@@ -187,15 +190,27 @@ class PINNNet(nn.Module):
             layers.append(nn.Linear(in_dim, h))
             layers.append(nn.Tanh())
             in_dim = h
-        layers.append(nn.Linear(in_dim, 4))
+        layers.append(nn.Linear(in_dim, 4))   # unrestricted output; positivity via relu below
         self.mlp = nn.Sequential(*layers)
+        # Hard IC: register y0 as a non-trainable buffer of shape (N_nodes, 4).
+        # At t=0 the network returns y0[node] exactly, for every node.
+        if y0_anchor is not None:
+            self.register_buffer('y0_anchor',
+                                 torch.tensor(y0_anchor, dtype=torch.float32))
+        else:
+            self.register_buffer('y0_anchor', None)
 
     def forward(self, t: torch.Tensor, node_onehot: torch.Tensor) -> torch.Tensor:
-        t_norm = t / self.T_final
+        t_norm = t / self.T_final                        # in [0, 1]
         te = torch.tanh(self.time_fc(t_norm))
         ne = torch.tanh(self.node_embed(node_onehot))
         x  = torch.cat([te, ne], dim=1)
-        return torch.nn.functional.softplus(self.mlp(x))
+        correction = self.mlp(x)                         # unrestricted (B, 4)
+        # Hard IC: u(t=0, node_i) = y0[i] exactly.
+        # one_hot_i @ y0_anchor selects row i of y0_anchor (B, 4).
+        y0_i = node_onehot @ self.y0_anchor
+        # relu clamps to [0, ∞); at t=0 output = relu(y0_i) = y0_i since y0 ≥ 0.
+        return torch.relu(y0_i + t_norm * correction)
 
 # ---------------------------
 # Normalized random-walk movement operator
@@ -269,157 +284,158 @@ def pinn_loss(model: nn.Module, t_colloc: torch.Tensor, node_onehots: torch.Tens
     res_norm = (dpred_dt - rhs_full) / (scales.unsqueeze(0) + 1e-8)
     res_loss = torch.mean(res_norm ** 2)
 
-    t0_val    = float(t_colloc[0].item())
-    t0_tensor = torch.full((N_nodes, 1), t0_val, dtype=torch.float32, device=device)
-    pred_t0   = model(t0_tensor, node_onehots)
-    y0_tensor = torch.tensor(y0_full, dtype=torch.float32, device=device)
-    ic_norm   = (pred_t0 - y0_tensor) / (scales + 1e-8)
-    ic_loss   = torch.mean(ic_norm ** 2)
-
-    # Reduced IC weight so dynamics can be learned
-    loss    = res_loss + 5.0 * ic_loss
-    metrics = {"res_loss": res_loss.item(), "ic_loss": ic_loss.item()}
+    # IC is hard-enforced by the network architecture:
+    #   u(t=0, node_i) = y0[i] exactly  (see PINNNet.forward).
+    # No separate ic_loss term is needed or computed.
+    loss    = res_loss
+    metrics = {"res_loss": res_loss.item(), "ic_loss": 0.0}
     return loss, metrics
-
-# def initial_condition(N_nodes: int, seed_node: int = 0,
-#                       I_h_start: float = I_h, I_v_start: float = I_v) -> np.ndarray:
-#     eps = 1e-12
-#     mu = mu_v + delta_v
-#     d = mu_h + gamma + theta
-#     b = d * ( (beta_v * beta_h * (mu_h + theta) / (d + eps)) - 2.0 * (mu**2) * Lambda_h - mu * Lambda_h * beta_v )
-#     R02 = (beta_h * beta_v * mu_h * Lambda_v) / ( (mu_h + gamma + theta) * (mu + eps)**2 * Lambda_h + eps )
-#     disc = b**2 - 4.0 * (mu**3) * (d**2) * (Lambda_h**2) * (1.0 - R02) * (mu + beta_v)
-#     disc = np.maximum(disc, 0.0)   # clamp negative numerical noise
-#     den_lambda_h = 2.0 * mu * Lambda_h * (mu + beta_v) + eps
-#     lambda_h = (b + np.sqrt(disc)) / den_lambda_h
-#     lambda_hp = (b - np.sqrt(disc)) / den_lambda_h
-#     lambda_v = beta_v * lambda_h / (d + lambda_h + eps)
-#     S_h_star = Lambda_h / (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps)
-#     I_h_star = (lambda_h * Lambda_h) / ( (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps) * (d + eps) )
-#     S_v_star = Lambda_v / (mu + lambda_v + eps)
-#     I_v_star = (Lambda_v * lambda_v) / (mu * (mu + lambda_v + eps) + eps)
-#     S_h0 = S_h_star.copy()
-#     I_h0 = np.zeros(N_nodes, dtype=np.float32)
-#     S_v0 = S_v_star.copy()
-#     I_v0 = np.zeros(N_nodes, dtype=np.float32)
-#     if not (0 <= seed_node < N_nodes):
-#         raise ValueError(f"seed_node must be in [0, {N_nodes - 1}]")
-#     I_h0[seed_node] = float(I_h_start)
-#     I_v0[seed_node] = float(I_v_start)
-#     return np.stack([S_h0, I_h0, S_v0, I_v0], axis=1).astype(np.float32)  # (N, 4)
-
-# # Remplacer la fonction initial_condition existante par celle-ci
-# def initial_condition(N_nodes: int, seed_node: int = 0) -> np.ndarray:
-#     """
-#     Retourne y0_full (N,4) initialisé avec les valeurs d'equilibre endemique (EE)
-#     calculées précédemment : S_h, I_h, S_v, I_v (vecteurs numpy).
-#     - N_nodes : nombre de noeuds (doit correspondre à la taille de S_h, etc.)
-#     - seed_node : index du noeud initial (conservé pour compatibilité)
-#     """
-#     # Vérifications rapides
-#     if not ('S_h' in globals() and 'I_h' in globals() and 'S_v' in globals() and 'I_v' in globals()):
-#         raise RuntimeError("Les vecteurs S_h, I_h, S_v, I_v doivent être définis avant d'appeler initial_condition().")
-
-#     if not (0 <= seed_node < N_nodes):
-#         raise ValueError(f"seed_node must be in [0, {N_nodes - 1}]")
-
-#     # Utiliser les EE calculées (déjà vectorisées)
-#     S_h0 = S_h.copy().astype(np.float32)   # (N,)
-#     I_h0 = I_h.copy().astype(np.float32)
-#     S_v0 = S_v.copy().astype(np.float32)
-#     I_v0 = I_v.copy().astype(np.float32)
-
-#     # Assurer non-négativité numérique
-#     S_h0 = np.maximum(S_h0, 0.0)
-#     I_h0 = np.maximum(I_h0, 0.0)
-#     S_v0 = np.maximum(S_v0, 0.0)
-#     I_v0 = np.maximum(I_v0, 0.0)
-
-#     # Re-imposer éventuellement un petit seed si I_h0[seed_node] est trop petit
-#     # (optionnel) : si vous voulez forcer un petit germe, décommentez la ligne suivante
-#     # I_h0[seed_node] = max(I_h0[seed_node], 1e-6)
-#     # I_v0[seed_node] = max(I_v0[seed_node], 1e-6)
-    
-#     # I_h0 = np.zeros(N_nodes, dtype=np.float32)
-#     # I_v0 = np.zeros(N_nodes, dtype=np.float32)
-#     # if not (0 <= seed_node < N_nodes):
-#     #     raise ValueError(f"seed_node must be in [0, {N_nodes - 1}]")
-#     # I_h0[seed_node] = max(I_h0[seed_node], 1e-6)
-#     # I_v0[seed_node] = max(I_v0[seed_node], 1e-6)
-
-#     y0 = np.stack([S_h0, I_h0, S_v0, I_v0], axis=1)  # (N,4)
-#     return y0.astype(np.float32)
-
 
 # ---------------------------
 # Replace initial_condition and y0_full creation so susceptibles are uniform
 # across nodes and infected states are seeded at seed_node using analytic I_h/I_v.
 # ---------------------------
-def initial_condition(N_nodes: int, seed_node: int = 0,
-                      use_analytic_seed: bool = True,
-                      S_h_uniform_from: str = "mean") -> np.ndarray:
+# def initial_condition(N_nodes: int, seed_node: int = 0,
+#                       use_analytic_seed: bool = True,
+#                       S_h_uniform_from: str = "mean") -> np.ndarray:
+#     """
+#     Build initial condition y0_full (N,4) with:
+#       - Susceptibles uniform across all nodes (S_h and S_v).
+#         S_h_uniform_from: "mean" -> use mean(EE S_h); "seed" -> use S_h[seed_node];
+#                           "dfe"  -> use DFE S_h (Lambda_h/mu_h).
+#       - Infecteds zero everywhere except at seed_node where they are set to the
+#         analytic EE infected values I_h[seed_node], I_v[seed_node] if
+#         use_analytic_seed=True, otherwise a small numeric seed is used.
+#     """
+#     # Preconditions: analytic EE vectors S_h, I_h, S_v, I_v must exist
+#     required = ('S_h' in globals() and 'I_h' in globals() and 'S_v' in globals() and 'I_v' in globals())
+#     if not required:
+#         raise RuntimeError("S_h, I_h, S_v, I_v must be defined before calling initial_condition().")
+
+#     if not (0 <= seed_node < N_nodes):
+#         raise ValueError(f"seed_node must be in [0, {N_nodes-1}]")
+    
+#     eps = 1e-12
+#     mu = mu_v + delta_v
+#     d = mu_h + gamma + theta
+#     beta_h = (1.0 + 10.0) * d * (mu_v + delta_v)**2 * Lambda_h / (beta_v * mu_h * Lambda_v + eps)
+#     b = d * ( (beta_v * beta_h * (mu_h + theta) / (d + eps)) - 2.0 * mu**2 * Lambda_h - mu * Lambda_h * beta_v )
+#     R02 = (beta_h * beta_v * mu_h * Lambda_v) / ( (mu_h + gamma + theta) * mu**2 * Lambda_h + eps )
+#     disc = b**2 - 4.0 * mu**3 * d**2 * Lambda_h**2 * (1.0 - R02) * (mu + beta_v)
+#     disc = np.maximum(disc, 0.0)   # clamp negative numerical noise
+#     den_lambda_h = 2.0 * mu * Lambda_h * (mu + beta_v) + eps
+#     lambda_h = (b + np.sqrt(disc)) / den_lambda_h
+#     # lambda_h = (b - np.sqrt(disc)) / den_lambda_h
+#     lambda_v = beta_v * lambda_h / (d + lambda_h + eps)
+#     S_h = Lambda_h / (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps)
+#     I_h = (lambda_h * Lambda_h) / ( (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps) * (d + eps) )
+#     S_v = Lambda_v / (mu + lambda_v + eps)
+#     I_v = (Lambda_v * lambda_v) / (mu * (mu + lambda_v + eps) + eps)
+    
+#     # Determine uniform susceptible values
+#     if S_h_uniform_from == "mean":
+#         S_h_uniform = float(np.mean(S_h))
+#         S_v_uniform = float(np.mean(S_v))
+#     elif S_h_uniform_from == "seed":
+#         S_h_uniform = float(S_h[seed_node])
+#         S_v_uniform = float(S_v[seed_node])
+#     elif S_h_uniform_from == "EE":
+#         S_h_uniform = float(np.mean(S_h))
+#         S_v_uniform = float(np.mean(S_v))
+#     else:
+#         raise ValueError("S_h_uniform_from must be one of: 'mean','seed','EE'")
+
+#     # Build uniform susceptibles arrays
+#     S_h0 = np.full(N_nodes, S_h_uniform, dtype=np.float32)
+#     S_v0 = np.full(N_nodes, S_v_uniform, dtype=np.float32)
+
+#     # Infecteds: zero everywhere except seed_node
+#     I_h0 = np.zeros(N_nodes, dtype=np.float32)
+#     I_v0 = np.zeros(N_nodes, dtype=np.float32)
+
+#     if use_analytic_seed:
+#         # use analytic EE infected values at seed_node
+#         I_h0[seed_node] = float(I_h[seed_node])
+#         I_v0[seed_node] = float(I_v[seed_node])
+#     else:
+#         # small numeric seed if requested
+#         I_h0[seed_node] = max(1e-6, float(I_h[seed_node]))
+#         I_v0[seed_node] = max(1e-6, float(I_v[seed_node]))
+
+#     # Ensure non-negativity
+#     S_h0 = np.maximum(S_h0, 0.0)
+#     I_h0 = np.maximum(I_h0, 0.0)
+#     S_v0 = np.maximum(S_v0, 0.0)
+#     I_v0 = np.maximum(I_v0, 0.0)
+
+#     y0 = np.stack([S_h0, I_h0, S_v0, I_v0], axis=1)  # (N,4)
+#     return y0.astype(np.float32)
+
+# # --- Replace previous y0_full assignment with the new initial_condition call ---
+# # Choose seed_node and options as desired:
+# seed_node = 0
+# # Options:
+# #   use_analytic_seed=True  -> seed infected at seed_node with analytic I_h/I_v
+# #   S_h_uniform_from: "mean" | "seed" | "dfe"
+# y0_full = initial_condition(N_nodes, seed_node=seed_node,
+#                             use_analytic_seed=True,
+#                             S_h_uniform_from="mean")
+
+# # Debug print to confirm
+# print("Initial condition (seed node):", y0_full[seed_node])
+# print("Uniform S_h used:", float(y0_full[0,0]), "Uniform S_v used:", float(y0_full[0,2]))
+# print("Initial I_h at seed node:", float(y0_full[seed_node,1]), "Initial I_v at seed node:", float(y0_full[seed_node,3]))
+
+# ---------------------------
+# Initial condition: uniform susceptibles, infected seeded at one node using analytic EE
+# ---------------------------
+def initial_condition_seeded(N_nodes: int, seed_node: int = 0,
+                             S_h_uniform_from: str = "mean",
+                             use_analytic_seed: bool = True,
+                             min_seed: float = 1e-12) -> np.ndarray:
     """
-    Build initial condition y0_full (N,4) with:
-      - Susceptibles uniform across all nodes (S_h and S_v).
-        S_h_uniform_from: "mean" -> use mean(EE S_h); "seed" -> use S_h[seed_node];
-                          "dfe"  -> use DFE S_h (Lambda_h/mu_h).
-      - Infecteds zero everywhere except at seed_node where they are set to the
-        analytic EE infected values I_h[seed_node], I_v[seed_node] if
-        use_analytic_seed=True, otherwise a small numeric seed is used.
+    Build y0_full (N,4) with:
+      - Susceptibles uniform across nodes (S_h and S_v).
+        S_h_uniform_from: "mean" -> mean(EE S_h); "seed" -> S_h[seed_node]; "dfe" -> DFE mean.
+      - Infecteds zero everywhere except at seed_node where they are set to analytic EE I_h/I_v
+        (or to min_seed if analytic value is numerically zero).
     """
-    # Preconditions: analytic EE vectors S_h, I_h, S_v, I_v must exist
+    # Preconditions: S_h, I_h, S_v, I_v must exist (computed earlier)
     required = ('S_h' in globals() and 'I_h' in globals() and 'S_v' in globals() and 'I_v' in globals())
     if not required:
-        raise RuntimeError("S_h, I_h, S_v, I_v must be defined before calling initial_condition().")
+        raise RuntimeError("Analytic EE vectors S_h, I_h, S_v, I_v must be defined before calling this function.")
 
     if not (0 <= seed_node < N_nodes):
         raise ValueError(f"seed_node must be in [0, {N_nodes-1}]")
-    
-    eps = 1e-12
-    mu = mu_v + delta_v
-    d = mu_h + gamma + theta
-    b = d * ( (beta_v * beta_h * (mu_h + theta) / (d + eps)) - 2.0 * (mu**2) * Lambda_h - mu * Lambda_h * beta_v )
-    R02 = (beta_h * beta_v * mu_h * Lambda_v) / ( (mu_h + gamma + theta) * (mu + eps)**2 * Lambda_h + eps )
-    disc = b**2 - 4.0 * (mu**3) * (d**2) * (Lambda_h**2) * (1.0 - R02) * (mu + beta_v)
-    disc = np.maximum(disc, 0.0)   # clamp negative numerical noise
-    den_lambda_h = 2.0 * mu * Lambda_h * (mu + beta_v) + eps
-    lambda_h = (b + np.sqrt(disc)) / den_lambda_h
-    lambda_hp = (b - np.sqrt(disc)) / den_lambda_h
-    lambda_v = beta_v * lambda_h / (d + lambda_h + eps)
-    S_h = Lambda_h / (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps)
-    I_h = (lambda_h * Lambda_h) / ( (mu_h + lambda_h * (1.0 - gamma / (d + eps)) + eps) * (d + eps) )
-    S_v = Lambda_v / (mu + lambda_v + eps)
-    I_v = (Lambda_v * lambda_v) / (mu * (mu + lambda_v + eps) + eps)
-    
-    # Determine uniform susceptible values
+
+    # Choose uniform susceptible values
     if S_h_uniform_from == "mean":
         S_h_uniform = float(np.mean(S_h))
         S_v_uniform = float(np.mean(S_v))
     elif S_h_uniform_from == "seed":
         S_h_uniform = float(S_h[seed_node])
         S_v_uniform = float(S_v[seed_node])
-    elif S_h_uniform_from == "EE":
-        S_h_uniform = float(np.mean(S_h))
-        S_v_uniform = float(np.mean(S_v))
+    elif S_h_uniform_from == "dfe":
+        # DFE fallback
+        S_h_uniform = float(np.mean(Lambda_h / (mu_h + 1e-12)))
+        S_v_uniform = float(np.mean(Lambda_v / (mu_v + delta_v + 1e-12)))
     else:
-        raise ValueError("S_h_uniform_from must be one of: 'mean','seed','EE'")
+        raise ValueError("S_h_uniform_from must be one of: 'mean','seed','dfe'")
 
-    # Build uniform susceptibles arrays
+    # Build arrays
     S_h0 = np.full(N_nodes, S_h_uniform, dtype=np.float32)
     S_v0 = np.full(N_nodes, S_v_uniform, dtype=np.float32)
-
-    # Infecteds: zero everywhere except seed_node
     I_h0 = np.zeros(N_nodes, dtype=np.float32)
     I_v0 = np.zeros(N_nodes, dtype=np.float32)
 
+    # Seed infected at seed_node using analytic EE (or min_seed if analytic is zero)
     if use_analytic_seed:
-        # use analytic EE infected values at seed_node
-        I_h0[seed_node] = float(I_h[seed_node])
-        I_v0[seed_node] = float(I_v[seed_node])
+        I_h0[seed_node] = float(max(I_h[seed_node], min_seed))
+        I_v0[seed_node] = float(max(I_v[seed_node], min_seed))
     else:
-        # small numeric seed if requested
-        I_h0[seed_node] = max(1e-6, float(I_h[seed_node]))
-        I_v0[seed_node] = max(1e-6, float(I_v[seed_node]))
+        # small numeric seed
+        I_h0[seed_node] = float(min_seed)
+        I_v0[seed_node] = float(min_seed)
 
     # Ensure non-negativity
     S_h0 = np.maximum(S_h0, 0.0)
@@ -430,29 +446,35 @@ def initial_condition(N_nodes: int, seed_node: int = 0,
     y0 = np.stack([S_h0, I_h0, S_v0, I_v0], axis=1)  # (N,4)
     return y0.astype(np.float32)
 
-# --- Replace previous y0_full assignment with the new initial_condition call ---
-# Choose seed_node and options as desired:
-seed_node = 0
-# Options:
-#   use_analytic_seed=True  -> seed infected at seed_node with analytic I_h/I_v
-#   S_h_uniform_from: "mean" | "seed" | "dfe"
-y0_full = initial_condition(N_nodes, seed_node=seed_node,
-                            use_analytic_seed=True,
-                            S_h_uniform_from="mean")
+# --- Build seeded initial condition directly from the EE arrays (lines 143-146) ---
+# S_h (line 143) and S_v (line 145): uniform EE susceptibles across ALL nodes.
+# I_h (line 144) and I_v (line 146): EE infected only at seed_node; zero elsewhere.
+seed_node = 0   # change to the node you want to seed
 
-# Debug print to confirm
-print("Initial condition (seed node):", y0_full[seed_node])
-print("Uniform S_h used:", float(y0_full[0,0]), "Uniform S_v used:", float(y0_full[0,2]))
-print("Initial I_h at seed node:", float(y0_full[seed_node,1]), "Initial I_v at seed node:", float(y0_full[seed_node,3]))
+S_h0 = np.full(N_nodes, float(S_h[seed_node]), dtype=np.float32)   # EE S_h, uniform
+S_v0 = np.full(N_nodes, float(S_v[seed_node]), dtype=np.float32)   # EE S_v, uniform
+I_h0 = np.zeros(N_nodes, dtype=np.float32)                          # I_h = 0 everywhere
+I_v0 = np.zeros(N_nodes, dtype=np.float32)                          # I_v = 0 everywhere
+I_h0[seed_node] = float(I_h[seed_node])                             # seed EE I_h
+I_v0[seed_node] = float(I_v[seed_node])                             # seed EE I_v
+
+y0_full = np.stack([S_h0, I_h0, S_v0, I_v0], axis=1).astype(np.float32)  # (N, 4)
+
+print(f"IC — seed node {seed_node} : S_h={S_h0[seed_node]:.4g}  I_h={I_h0[seed_node]:.4g}  "
+      f"S_v={S_v0[seed_node]:.4g}  I_v={I_v0[seed_node]:.4g}")
+print(f"IC — non-seed node 1      : S_h={S_h0[1]:.4g}  I_h={I_h0[1]:.4g}  "
+      f"S_v={S_v0[1]:.4g}  I_v={I_v0[1]:.4g}")
+
 # ---------------------------
 # Training setup
 # ---------------------------
 torch.manual_seed(0)
 
 t0      = 0.0
-T_final = 30.0
+T_final = 100.0
 
-model        = PINNNet(N_nodes, hidden=(128, 128), T_final=T_final).to(device)
+model        = PINNNet(N_nodes, hidden=(128, 128), T_final=T_final,
+                       y0_anchor=y0_full).to(device)   # y0_full: seeded IC (N, 4)
 node_onehots = make_node_onehots(N_nodes, device)
 seed_node    = 0
 
@@ -463,13 +485,13 @@ t_colloc = torch.tensor(
     device=device
 )
 
-optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-6)
+optimizer = optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-8)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='min', factor=0.5, patience=400, min_lr=1e-6
 )
 
-n_epochs    = 5000
-print_every = 500
+n_epochs    = 10000
+print_every = 1000
 
 hist_loss = []
 hist_res  = []
@@ -522,6 +544,40 @@ def rk4_step(y, dt, rhs, *args):
     k3 = rhs(y + 0.5*dt*k2, *args)
     k4 = rhs(y + dt*k3, *args)
     return y + dt*(k1 + 2*k2 + 2*k3 + k4)/6
+
+def sweep_movement_and_run(m_vals):
+    results = []
+    for c_Sh_val, c_Ih_val, c_Sv_val, c_Iv_val in m_vals:
+        M_sh_tmp = c_Sh_val * P
+        Sigma_ih_tmp = c_Ih_val * P
+        Nu_sv_tmp = c_Sv_val * P
+        Nu_iv_tmp = c_Iv_val * P
+
+        y = y0_full.copy()
+        dt = 0.1
+        steps = 300
+        Ih_trace = np.zeros(steps+1)
+        Ih_trace[0] = y[seed_node,1]
+        for k in range(steps):
+            y = rk4_step(y, dt, rhs_graph_numpy, beta_h, beta_v, Lambda_h, Lambda_v,
+                        mu_h, mu_v, gamma, theta, delta_v, M_sh_tmp, Sigma_ih_tmp, Nu_sv_tmp, Nu_iv_tmp)
+            Ih_trace[k+1] = y[seed_node,1]
+        results.append({
+            "c_Sh": c_Sh_val, "c_Ih": c_Ih_val, "c_Sv": c_Sv_val, "c_Iv": c_Iv_val,
+            "Ih_final": Ih_trace[-1], "Ih_max": Ih_trace.max()
+        })
+    return results
+
+# Example sweep: vary human movement from 0 to 5, keep vectors immobile
+m_vals = [
+    (0.0, 0.0, 0.0, 0.0),
+    (2.5, 2.5, 0.0, 0.0),
+    (5.0, 5.0, 0.0, 0.0),
+    (10.0, 10.0, 0.0, 0.0),
+]
+res = sweep_movement_and_run(m_vals)
+for r in res:
+    print(r)
 
 # Diagnostic run parameters
 dt = 0.1
@@ -589,7 +645,7 @@ plt.show()
 # ---------------------------
 # Evaluate on fine time grid
 # ---------------------------
-t_test  = np.linspace(t0, T_final, 5001, dtype=np.float32)
+t_test  = np.linspace(t0, T_final, 10001, dtype=np.float32)
 Tt      = torch.tensor(t_test.reshape(-1, 1), dtype=torch.float32, device=device)
 node_onehots_eval = make_node_onehots(N_nodes, device)
 
@@ -604,8 +660,8 @@ with torch.no_grad():
 S_h = preds[:, :, 0];  I_h = preds[:, :, 1]
 S_v = preds[:, :, 2];  I_v = preds[:, :, 3]
 
-human_prev  = I_h / (S_h + I_h + 1e-8)
-vector_prev = I_v / (S_v + I_v + 1e-8)
+human_prev  = I_h / (S_h + I_h + 1e-12)
+vector_prev = I_v / (S_v + I_v + 1e-12)
 
 # ---------------------------
 # Spatio-temporal prevalence heatmaps
@@ -635,7 +691,7 @@ plt.show()
 # ---------------------------
 # Network snapshots (human prevalence)
 # ---------------------------
-snap_times   = [0.0, 12.0, 30.0]
+snap_times   = [0.0, 25.0, 50.0, 100.0]
 snap_indices = [int(np.argmin(np.abs(t_test - t))) for t in snap_times]
 pos = nx.spring_layout(G, seed=2)
 
