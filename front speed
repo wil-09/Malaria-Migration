@@ -1,0 +1,63 @@
+rm(list = ls(all.names = TRUE)) #will clear all objects includes hidden objects.
+gc() #free up memrory and report the memory usage.
+# 1. Load required libraries (ggplot2 for visualization)
+# library(dplyr)
+# library(tidyr)
+library(ggplot2)
+# library(tidybayes)
+library(readxl)
+# library(scales)
+# library(ggplot2)
+library(lmerTest)
+
+front_data <- read_excel("E:/Collective_Behavior_Projects/Graph Theory/Two_Patches_Malaria/Figure_28Aug26/m=sigma=0.9_wave_front.xlsx" )
+
+# ------------------------------------------------------------------------------
+
+# 2. Fit the linear model: tau_i = slope * d_i + b
+# fit <- lm(tau_i_vector ~ d_i + node, data = front_data)
+fit <- lm(tau_i_human ~ d_i*node, data = front_data)
+fit0 <- lm(tau_i_human ~ d_i, data = front_data)
+fit1 <- lm(tau_i_human ~ d_i + node, data = front_data)
+
+anova(fit0,fit)
+
+summary(fit)
+# 3. Extract the slope (1/c*) and intercept (b)
+summary_fit <- summary(fit)
+slope <- coef(fit)["d_i"]
+intercept <- coef(fit)["(Intercept)"]
+
+# 4. Calculate the global traveling front speed (c*)
+c_star <- 1 / slope
+
+# 5. Calculate 95% Confidence Intervals for c* using the Delta Method bounds
+# Extract standard error of the slope
+se_slope <- summary_fit$coefficients["d_i", "Std. Error"]
+ci_slope <- confint(fit, "d_i", level = 0.95)
+
+# Invert the slope bounds to get the non-linear CI for c*
+c_star_ci_lower <- 1 / ci_slope[2] # 1 / upper slope bound
+c_star_ci_upper <- 1 / ci_slope[1] # 1 / lower slope bound
+
+# 6. Display the metrics cleanly
+cat("==========================================\n")
+cat("  TRAVELING FRONT SPEED CHARACTERIZATION  \n")
+cat("==========================================\n")
+cat(sprintf("Estimated Speed (c*):       %.4f\n", c_star))
+cat(sprintf("95%% Confidence Interval:    [%.4f, %.4f]\n", c_star_ci_lower, c_star_ci_upper))
+cat(sprintf("Intercept (b, initial lag):  %.4f\n", intercept))
+cat(sprintf("R-squared value:            %.4f\n", summary_fit$r.squared))
+cat("==========================================\n")
+
+# 7. Plot the front arrival data and the fitted wave propagation line
+ggplot(front_data, aes(x = d_i, y = tau_i_vector)) +
+     geom_point(color = "darkblue", alpha = 0.6, size = 2) +
+     geom_smooth(method = "lm", formula = y ~ x, color = "red", se = TRUE, size = 1) +
+     labs(
+          title = bquote("Epidemic Traveling Front Fit (" ~ c^"*" == .(round(c_star, 3)) ~ ")"),
+          x = "Spatial Distance from Seed Node (d_i)",
+          y = "Half-Max Arrival Time (tau_i)"
+     ) +
+     theme_minimal()
+
