@@ -1,0 +1,318 @@
+"""
+1D density-weighted networked vector-host malaria model — implicit-only solver.
+
+PDE system (per node x on a 1D domain, density rho(x)):
+
+    dS_h/dt = Lambda_h - beta_h*S_h*I_v/(S_h+I_h) - mu_h*S_h + gamma*I_h
+              + (m/rho)      * div( rho * grad(S_h) )
+    dI_h/dt = beta_h*S_h*I_v/(S_h+I_h) - (gamma+mu_h+theta)*I_h
+              + (sigma/rho)  * div( rho * grad(I_h) )
+    dS_v/dt = Lambda_v - beta_v*S_v*I_h/(S_h+I_h) - (mu_v+delta_v)*S_v
+              + (nu/rho)     * div( rho * grad(S_v) )
+    dI_v/dt = beta_v*S_v*I_h/(S_h+I_h) - (mu_v+delta_v)*I_v
+              + (nu/rho)     * div( rho * grad(I_v) )
+
+Spatial discretization
+-----------------------
+The nodes live on a 1D line.  The network connecting them is built as an
+Erdos-Renyi random graph, edge-weighted by a *symmetric Gaussian kernel* of
+the node separations.  Following Coifman & Lafon (2006), the kernel is
+density-corrected using a KDE estimate rho_hat(x) of the sampled node
+distribution and then row-normalized into a random-walk matrix P.  The
+resulting graph Laplacian  L = I - P  is precisely a discrete approximation
+of the density-weighted operator  (1/rho) * div(rho * grad(.))  used in the
+PDE above, so the movement/diffusion term for a compartment u with rate c is
+
+    c/rho * div(rho grad u)   ~~>   c * (u - u @ P)
+
+This version solves the model with only the IMPLICIT (backward) Euler
+scheme using Picard fixed-point iterations for the nonlinear reaction
+terms -- the PINN diagnostic has been removed.
+
+Outputs
+-------
+  Figure 1: heatmap (x = time, y = node) -- human prevalence (top panel),
+            vector prevalence (bottom panel), from the implicit solver.
+  Figure 2: temporal trend of human (left) / vector (right) prevalence at
+            the seeded node and a handful of other representative nodes.
+"""
+
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.neighbors import KernelDensity
+from scipy import sparse
+
+# =====================================================================
+# 1. 1D node distribution + Erdos-Renyi / Gaussian-kernel random-walk graph
+# =====================================================================
+N_nodes = 2000
+graph_seed = 13579
+target_degree = 10          # ~10 neighbors per node
+cov_scale = 0.08            # spread of the 1D node distribution
+
+rng_graph = np.random.RandomState(graph_seed)
+
+# 1D spatial positions (line domain), sorted so that node index reflects position
+x_coords = rng_graph.normal(loc=0.0, scale=np.sqrt(cov_scale), size=N_nodes).astype(np.float64)
+x_coords.sort()
+
+# --- Erdos-Renyi topology with ~target_degree neighbors, min-degree guarantee ---
+p_er = target_degree / (N_nodes - 1)
+A_mask = (rng_graph.rand(N_nodes, N_nodes) < p_er)
+A_mask = np.triu(A_mask, 1)
+A_mask = A_mask | A_mask.T
+np.fill_diagonal(A_mask, False)
+
+for i in range(N_nodes):
+    deg_i = int(A_mask[i].sum())
+    if deg_i < target_degree:
+        # connect to the nearest (in 1D distance) currently-unconnected nodes
+        missing = target_degree - deg_i
+        dist_i = np.abs(x_coords - x_coords[i])
+        dist_i[i] = np.inf
+        dist_i[A_mask[i]] = np.inf
+        candidates = np.argsort(dist_i)[:missing]
+        A_mask[i, candidates] = True
+        A_mask[candidates, i] = True
+
+# --- symmetric Gaussian kernel weights on existing ER edges ---
+pair_d2 = (x_coords[:, None] - x_coords[None, :]) ** 2
+median_d2 = np.median(pair_d2[A_mask]) if np.any(A_mask) else 1.0
+kernel_eps = max(median_d2 * 0.5, 1e-8)
+W_raw = np.where(A_mask, np.exp(-pair_d2 / (2.0 * kernel_eps)), 0.0)
+W_raw = 0.5 * (W_raw + W_raw.T)   # enforce symmetry
+
+# --- density rho(x) learned (via KDE) from the node distribution ---
+kde_bandwidth = np.sqrt(kernel_eps)
+kde = KernelDensity(bandwidth=kde_bandwidth, kernel="gaussian")
+kde.fit(x_coords.reshape(-1, 1))
+rho_hat = np.exp(kde.score_samples(x_coords.reshape(-1, 1)))
+rho_hat = rho_hat / (rho_hat.mean() + 1e-12)
+
+# --- Coifman-Lafon density correction, then row-normalize -> random walk P ---
+q = W_raw.sum(axis=1)
+q_safe = np.maximum(q, 1e-12)
+W_tilde = W_raw / np.outer(q_safe, q_safe)
+W_tilde = 0.5 * (W_tilde + W_tilde.T)
+d_tilde = np.maximum(W_tilde.sum(axis=1), 1e-12)
+P_dense = W_tilde / d_tilde[:, None]           # row-stochastic random-walk matrix
+
+P_sparse = sparse.csr_matrix(P_dense)
+P_sparse_T = P_sparse.transpose().tocsr()
+
+deg_count = A_mask.sum(axis=1)
+print(f"\n1D Erdos-Renyi random-walk graph | N={N_nodes}, target degree={target_degree}")
+print(f"  Edges                : {int(A_mask.sum() / 2)}")
+print(f"  Average degree       : {deg_count.mean():.2f}  (min={deg_count.min()}, max={deg_count.max()})")
+print(f"  Row-sum of P (~1)    : min={P_dense.sum(axis=1).min():.6f}, max={P_dense.sum(axis=1).max():.6f}")
+print(f"  rho_hat mean/min/max : {rho_hat.mean():.4f}, {rho_hat.min():.4f}, {rho_hat.max():.4f}")
+
+# =====================================================================
+# 2. Heterogeneous (per-node) epidemiological + movement parameters
+# =====================================================================
+base = {
+    "beta_v": 0.48,
+    "mu_h": 0.000016,
+    "Lambda_h": 0.033,
+    "Lambda_v": 0.13,
+    "gamma": 0.000055,
+    "theta": 0.00009,
+    "mu_v": 0.033,
+    "delta_v": 0.0025,
+    "m_coef": 0.9,
+    "sigma_coef": 0.9,
+    "nu_coef": 0.0001,
+}
+rng_par = np.random.RandomState(graph_seed + 1)
+noise_scale = 0.05
+
+
+def make_pos(base_val: float) -> np.ndarray:
+    arr = base_val * (1.0 + noise_scale * rng_par.randn(N_nodes).astype(np.float64))
+    return np.maximum(arr, 1e-12)
+
+
+beta_v = make_pos(base["beta_v"])
+mu_h = make_pos(base["mu_h"])
+Lambda_h = make_pos(base["Lambda_h"])
+Lambda_v = make_pos(base["Lambda_v"])
+gamma = make_pos(base["gamma"])
+theta = make_pos(base["theta"])
+mu_v = make_pos(base["mu_v"])
+delta_v = make_pos(base["delta_v"])
+
+# ---------------------------
+# Diffusion (movement) coefficients: m for S_h, sigma for I_h, nu for S_v & I_v
+# now node-variable, drawn with the same heterogeneous-noise convention.
+# ---------------------------
+m_coef     = make_pos(base["m_coef"])
+sigma_coef = make_pos(base["sigma_coef"])
+nu_coef    = make_pos(base["nu_coef"])
+
+eps = 1e-12
+d_local = mu_h + gamma + theta
+mu_total_v = mu_v + delta_v
+# beta_h calibrated per node so that R0 is comfortably above threshold (as in the
+# original network PINN model), then perturbed with the same heterogeneous noise.
+beta_h = (1.0 + 10.0) * d_local * mu_total_v**2 * Lambda_h / (beta_v * mu_h * Lambda_v + eps)
+
+# =====================================================================
+# 3. Analytic per-node endemic equilibrium -> seeded initial condition
+# =====================================================================
+b = d_local * (
+    (beta_v * beta_h * (mu_h + theta) / (d_local + eps))
+    - 2.0 * (mu_total_v**2) * Lambda_h
+    - mu_total_v * Lambda_h * beta_v
+)
+R02 = (beta_h * beta_v * mu_h * Lambda_v) / (
+    (mu_h + gamma + theta) * (mu_total_v + eps) ** 2 * Lambda_h + eps
+)
+disc = np.maximum(b**2 - 4.0 * mu_total_v**3 * d_local**2 * Lambda_h**2 * (1.0 - R02) * (mu_total_v + beta_v), 0.0)
+den_lambda_h = np.maximum(2.0 * mu_total_v * Lambda_h * (mu_total_v + beta_v) + eps, 1e-12)
+lambda_h = np.clip((b + np.sqrt(disc)) / den_lambda_h, 0.0, 1e6)
+lambda_v = np.clip(beta_v * lambda_h / (d_local + lambda_h + eps), 0.0, 1e6)
+
+S_h_eq = np.maximum(Lambda_h / (mu_h + lambda_h * (1.0 - gamma / (d_local + eps)) + eps), 0.0)
+I_h_eq = np.maximum(
+    lambda_h * Lambda_h / ((mu_h + lambda_h * (1.0 - gamma / (d_local + eps)) + eps) * (d_local + eps)), 0.0
+)
+S_v_eq = np.maximum(Lambda_v / (mu_total_v + lambda_v + eps), 0.0)
+I_v_eq = np.maximum(Lambda_v * lambda_v / (mu_total_v * (mu_total_v + lambda_v + eps) + eps), 0.0)
+
+print(f"\nR0 (mean R02) ~= {np.mean(R02):.3f}  (min={R02.min():.3f}, max={R02.max():.3f})")
+
+seed_node = 0
+# S_h0 = np.full(N_nodes, S_h_eq)
+# S_v0 = np.full(N_nodes, S_v_eq)
+S_h0 = S_h_eq.copy()
+S_v0 = S_v_eq.copy()
+I_h0 = np.zeros(N_nodes, dtype=np.float64)
+I_v0 = np.zeros(N_nodes, dtype=np.float64)
+I_h0[seed_node] = float(max(I_h_eq[seed_node], 1e-8))
+I_v0[seed_node] = float(max(I_v_eq[seed_node], 1e-8))
+y0_full = np.stack([S_h0, I_h0, S_v0, I_v0], axis=1)   # (N, 4)
+
+# =====================================================================
+# 4. RHS + implicit (backward) Euler solver (NumPy / SciPy sparse)
+# =====================================================================
+row_sum_m = m_coef * np.asarray(P_sparse.sum(axis=1)).flatten()
+row_sum_s = sigma_coef * np.asarray(P_sparse.sum(axis=1)).flatten()
+row_sum_n = nu_coef * np.asarray(P_sparse.sum(axis=1)).flatten()
+
+
+def movement_np(u: np.ndarray, coef: np.ndarray, row_sum: np.ndarray) -> np.ndarray:
+    """Discrete (1/rho) div(rho grad u) movement term: c*(u - u @ P), c per-node."""
+    return row_sum * u - coef * P_sparse_T.dot(u)
+
+
+def rhs_graph_numpy(y: np.ndarray) -> np.ndarray:
+    S_h, I_h, S_v, I_v = y[:, 0], y[:, 1], y[:, 2], y[:, 3]
+    denom = np.maximum(S_h + I_h, 1e-8)
+    inf_h = beta_h * (S_h * I_v / denom)
+    inf_v = beta_v * (S_v * I_h / denom)
+
+    dS_h_local = Lambda_h - inf_h - mu_h * S_h + gamma * I_h
+    dI_h_local = inf_h - (gamma + mu_h + theta) * I_h
+    dS_v_local = Lambda_v - inf_v - mu_total_v * S_v
+    dI_v_local = inf_v - mu_total_v * I_v
+
+    dS_h = dS_h_local - movement_np(S_h, m_coef, row_sum_m)
+    dI_h = dI_h_local - movement_np(I_h, sigma_coef, row_sum_s)
+    dS_v = dS_v_local - movement_np(S_v, nu_coef, row_sum_n)
+    dI_v = dI_v_local - movement_np(I_v, nu_coef, row_sum_n)
+    return np.stack([dS_h, dI_h, dS_v, dI_v], axis=1)
+
+
+def implicit_euler_step(y: np.ndarray, dt: float, tol: float = 1e-8,
+                         max_iter: int = 25, relax: float = 0.7):
+    """Backward-Euler step solved with damped Picard fixed-point iteration."""
+    y_prev = y.copy()
+    y_next = np.maximum(y_prev + dt * rhs_graph_numpy(y_prev), 0.0)
+    converged = False
+    last_delta = np.inf
+    for _ in range(max_iter):
+        candidate = np.maximum(y_prev + dt * rhs_graph_numpy(y_next), 0.0)
+        updated = relax * candidate + (1.0 - relax) * y_next
+        updated = np.nan_to_num(updated, nan=0.0, posinf=1e12, neginf=0.0)
+        last_delta = np.linalg.norm((updated - y_next).ravel()) / (np.linalg.norm(updated.ravel()) + 1e-12)
+        y_next = updated
+        if last_delta < tol:
+            converged = True
+            break
+    return y_next, converged, last_delta
+
+
+# ---------------------------
+# Time integration
+# ---------------------------
+T_final = 250.0
+dt = 0.01
+n_steps = int(round(T_final / dt))
+t_grid = np.linspace(0.0, T_final, n_steps + 1, dtype=np.float64)
+
+traj_imp = np.zeros((n_steps + 1, N_nodes, 4), dtype=np.float64)
+traj_imp[0] = y0_full
+y_cur = traj_imp[0].copy()
+
+failed_steps = 0
+print(f"\nRunning implicit Euler solver ({n_steps} steps, dt={dt}) ...")
+_start = time.time()
+for k in range(n_steps):
+    y_cur, converged, _ = implicit_euler_step(y_cur, dt)
+    if not converged:
+        failed_steps += 1
+    traj_imp[k + 1] = y_cur
+print(f"Implicit solver finished in {time.time() - _start:.1f}s "
+      f"(non-converged steps: {failed_steps}/{n_steps})")
+
+prev_h_imp = traj_imp[:, :, 1] / np.maximum(traj_imp[:, :, 0] + traj_imp[:, :, 1], 1e-12)
+prev_v_imp = traj_imp[:, :, 3] / np.maximum(traj_imp[:, :, 2] + traj_imp[:, :, 3], 1e-12)
+
+# =====================================================================
+# Figure 1: heatmap (x = time, y = node) — human (top), vector (bottom)
+# =====================================================================
+fig1, axs1 = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
+
+vmin_h, vmax_h = float(np.nanmin(prev_h_imp)), float(np.nanmax(prev_h_imp))
+im0 = axs1[0].imshow(prev_h_imp.T, aspect="auto", origin="lower",
+                     extent=[t_grid[0], t_grid[-1], 0, N_nodes - 1],
+                     cmap="viridis", vmin=vmin_h, vmax=vmax_h)
+axs1[0].set_title("Human prevalence — 1D density-weighted network")
+axs1[0].set_ylabel("Node")
+plt.colorbar(im0, ax=axs1[0]).set_label("Human prevalence")
+
+vmin_v, vmax_v = float(np.nanmin(prev_v_imp)), float(np.nanmax(prev_v_imp))
+im1 = axs1[1].imshow(prev_v_imp.T, aspect="auto", origin="lower",
+                     extent=[t_grid[0], t_grid[-1], 0, N_nodes - 1],
+                     cmap="magma", vmin=vmin_v, vmax=vmax_v)
+axs1[1].set_title("Vector prevalence — 1D density-weighted network")
+axs1[1].set_xlabel("Time")
+axs1[1].set_ylabel("Node")
+plt.colorbar(im1, ax=axs1[1]).set_label("Vector prevalence")
+
+plt.tight_layout()
+plt.show()
+
+# =====================================================================
+# Figure 2: temporal trend — human (left) / vector (right) at selected nodes
+# =====================================================================
+requested_nodes = [seed_node, 250, 500, 750, 1000, 1250, 1500, 1750, 2000]
+plot_nodes = [min(node, N_nodes - 1) for node in requested_nodes]
+
+fig2, axs2 = plt.subplots(1, 2, figsize=(16, 6), sharex=True)
+for req_node, node in zip(requested_nodes, plot_nodes):
+    label = f"Node {req_node}" if req_node == node else f"Node {req_node} (-> {node})"
+    axs2[0].plot(t_grid, prev_h_imp[:, node], lw=1.8, label=label)
+    axs2[1].plot(t_grid, prev_v_imp[:, node], lw=1.8, label=label)
+
+axs2[0].set_title("Human prevalence — temporal trend")
+axs2[0].set_xlabel("Time"); axs2[0].set_ylabel("Human prevalence")
+axs2[0].grid(True, alpha=0.3); axs2[0].legend(fontsize="small")
+
+axs2[1].set_title("Vector prevalence — temporal trend")
+axs2[1].set_xlabel("Time"); axs2[1].set_ylabel("Vector prevalence")
+axs2[1].grid(True, alpha=0.3); axs2[1].legend(fontsize="small")
+
+plt.tight_layout()
+plt.show()
