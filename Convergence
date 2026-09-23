@@ -1,0 +1,1369 @@
+"""
+Convergence experiment for the malaria graph and continuum models.
+
+The script compares:
+
+Discrete graph model:
+    dU_i/dt = Reaction(U_i, x_i)
+               + D/(kappa_K * epsilon) * sum_j P_ij (U_j - U_i)
+
+Continuum model:
+    partial_t U = Reaction(U, x)
+                  + D/rho(x) * partial_x(rho(x) partial_x U)
+
+where:
+    U = (S_h, I_h, S_v, I_v),
+    D = (m, sigma, nu, nu).
+
+The experiment:
+  1. Solves the continuum PDE on a fine one-dimensional grid.
+  2. Samples N graph nodes from a prescribed density rho(x).
+  3. Constructs a density-corrected kernel graph.
+  4. Solves the graph ODE system.
+  5. Interpolates the continuum solution to graph nodes.
+  6. Computes relative weighted L2 and Linfinity errors.
+  7. Repeats the experiment over several random graph realizations.
+  8. Fits empirical convergence rates.
+
+Boundary conditions:
+    Zero flux:
+        rho(x) partial_x U(x,t) = 0 at x = 0 and x = 1.
+
+Required packages:
+    numpy
+    scipy
+    pandas
+    matplotlib
+
+Tested conceptually with Python 3.10+.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Dict, List, Tuple
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.integrate import solve_ivp
+from scipy.interpolate import PchipInterpolator
+from scipy.sparse import csr_matrix, diags, eye, kron
+from scipy.sparse.linalg import eigs
+
+
+# ---------------------------------------------------------------------
+# 1. Model and numerical configuration
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelParameters:
+    """Epidemiological and mobility parameters."""
+
+    # Human demography
+    Lambda_h: float = 0.033
+    mu_h: float = 1.6e-5
+    theta: float = 1.0e-5
+    gamma: float = 5.5e-4
+
+    # Vector demography
+    Lambda_v: float = 0.13
+    mu_v: float = 0.033
+    delta_v: float = 0.025
+
+    # Transmission
+    beta_h: float = 0.022
+    beta_v: float = 0.44
+
+    # Macroscopic continuum mobility coefficients
+    m: float = 2.0e-4
+    sigma: float = 2.0e-4
+    nu: float = 2.0e-8
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    """Configuration for the convergence experiment."""
+
+    # Final integration time
+    final_time: float = 100.0
+
+    # Continuum reference-grid size
+    continuum_points: int = 1200
+
+    # Graph sizes
+    node_counts: Tuple[int, ...] = (100, 250, 500, 1000, 1500)
+
+    # epsilon_N = epsilon_prefactor * N^(-epsilon_power)
+    #
+    # In one dimension, consistency normally requires:
+    #     epsilon -> 0,
+    #     N * sqrt(epsilon) -> infinity.
+    #
+    # epsilon_power = 0.8 satisfies these conditions.
+    epsilon_prefactor: float = 0.32
+    epsilon_power: float = 0.8
+
+    # Number of independent network realizations per N
+    repetitions: int = 5
+
+    # Density-correction exponent
+    alpha: float = 0.5
+
+    # Gaussian kernel constant:
+    # kappa_K = integral(z^2 K(z)) dz / (2 integral K(z) dz)
+    gaussian_kappa: float = 0.5
+
+    # ODE tolerances
+    rtol: float = 2.0e-6
+    atol: float = 1.0e-8
+
+    # Integrator
+    method: str = "BDF"
+
+    # Initial random seed
+    random_seed: int = 20260920
+
+    # Output directory
+    output_directory: str = "convergence_results"
+
+
+# ---------------------------------------------------------------------
+# 2. Sampling density and spatially heterogeneous parameters
+# ---------------------------------------------------------------------
+
+def unnormalized_density(x: np.ndarray) -> np.ndarray:
+    """
+    Smooth positive node-sampling density on [0,1].
+
+    The density is deliberately nonuniform so that the continuum
+    operator contains a nonzero drift term:
+        (1/rho) d/dx(rho du/dx).
+    """
+    x = np.asarray(x)
+    return (
+        0.28
+        + 1.20 * np.exp(-0.5 * ((x - 0.30) / 0.11) ** 2)
+        + 0.80 * np.exp(-0.5 * ((x - 0.72) / 0.16) ** 2)
+    )
+
+
+def make_normalized_density(
+    fine_points: int = 50_001,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Construct a normalized probability density and its CDF.
+
+    Returns
+    -------
+    grid:
+        Fine grid on [0,1].
+    density:
+        Normalized density on that grid.
+    cdf:
+        Numerically normalized cumulative distribution.
+    """
+    grid = np.linspace(0.0, 1.0, fine_points)
+    values = unnormalized_density(grid)
+
+    normalization = np.trapezoid(values, grid)
+    density = values / normalization
+
+    dx = grid[1] - grid[0]
+    cdf = np.zeros_like(grid)
+    cdf[1:] = np.cumsum(0.5 * (density[:-1] + density[1:]) * dx)
+    cdf /= cdf[-1]
+
+    return grid, density, cdf
+
+
+_DENSITY_GRID, _DENSITY_VALUES, _DENSITY_CDF = make_normalized_density()
+
+
+def rho(x: np.ndarray) -> np.ndarray:
+    """Evaluate the normalized sampling density."""
+    return np.interp(x, _DENSITY_GRID, _DENSITY_VALUES)
+
+
+def sample_nodes_from_density(
+    number_of_nodes: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample and sort graph nodes according to rho(x)."""
+    uniform_samples = rng.uniform(0.0, 1.0, number_of_nodes)
+    nodes = np.interp(uniform_samples, _DENSITY_CDF, _DENSITY_GRID)
+
+    # Sorting is not mathematically required, but simplifies plotting.
+    return np.sort(nodes)
+
+
+def heterogeneous_parameters(
+    x: np.ndarray,
+    parameters: ModelParameters,
+) -> Dict[str, np.ndarray]:
+    """
+    Define smooth spatial heterogeneity.
+
+    The same functions are used in both discrete and continuum models.
+    This avoids introducing an artificial mismatch between them.
+    """
+    x = np.asarray(x)
+    
+    seed = 13579
+    noise_scale = 0.001
+    rng = np.random.RandomState(seed + 1)
+    
+    beta_h = parameters.beta_h * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # + 0.15 * np.sin(2.0 * np.pi * x)
+    )
+
+    beta_v = parameters.beta_v * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.10 * np.cos(2.0 * np.pi * x)
+    )
+
+    Lambda_h = parameters.Lambda_h * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.08 * np.cos(2.0 * np.pi * x)
+    )
+
+    Lambda_v = parameters.Lambda_v * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.10 * np.sin(2.0 * np.pi * x + 0.4)
+    )
+    mu_h = parameters.mu_h * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.05 * np.sin(2.0 * np.pi * x + 0.2)
+    )
+    mu_v = parameters.mu_v * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.05 * np.sin(2.0 * np.pi * x + 0.2)
+    )
+    delta_v = parameters.delta_v * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.05 * np.sin(2.0 * np.pi * x + 0.2)
+    )
+    gamma = parameters.gamma * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.05 * np.sin(2.0 * np.pi * x + 0.2)
+    )
+    theta = parameters.theta * (
+        1.0 +  noise_scale * rng.randn(len(x))
+        # 1.0 + 0.05 * np.sin(2.0 * np.pi * x + 0.2)
+    )
+
+    return {
+        "beta_h": beta_h,
+        "beta_v": beta_v,
+        "Lambda_h": Lambda_h,
+        "Lambda_v": Lambda_v,
+        "mu_h": mu_h,
+        "mu_v": mu_v,
+        "delta_v": delta_v,
+        "gamma": gamma,
+        "theta": theta,
+    }
+
+
+# ---------------------------------------------------------------------
+# 3. Initial conditions
+# ---------------------------------------------------------------------
+
+def initial_condition(
+    x: np.ndarray,
+    parameters: ModelParameters,
+) -> np.ndarray:
+    """
+    Smooth non-equilibrium initial state.
+
+    Infection is initially localized near x = 0.28. Smooth initial data
+    are preferable in a continuum convergence experiment because they
+    reduce errors caused by interpolation and unresolved discontinuities.
+
+    Returns
+    -------
+    state:
+        Array of shape (4, len(x)), ordered as:
+            S_h, I_h, S_v, I_v.
+    """
+    x = np.asarray(x)
+    local = heterogeneous_parameters(x, parameters)
+
+    disease_free_humans = local["Lambda_h"] / parameters.mu_h
+    disease_free_vectors = (
+        local["Lambda_v"] / (parameters.mu_v + parameters.delta_v)
+    )
+
+    infection_profile = np.exp(-0.5 * ((x - 0.28) / 0.055) ** 2)
+
+    infected_humans = 0.015 * disease_free_humans * infection_profile
+    susceptible_humans = disease_free_humans - infected_humans
+
+    infected_vectors = 0.020 * disease_free_vectors * infection_profile
+    susceptible_vectors = disease_free_vectors - infected_vectors
+
+    return np.vstack(
+        [
+            susceptible_humans,
+            infected_humans,
+            susceptible_vectors,
+            infected_vectors,
+        ]
+    )
+
+
+# ---------------------------------------------------------------------
+# 4. Local malaria reaction system
+# ---------------------------------------------------------------------
+
+def reaction_terms(
+    state: np.ndarray,
+    x: np.ndarray,
+    parameters: ModelParameters,
+) -> np.ndarray:
+    """
+    Evaluate the reaction part of Eq. (26).
+
+    Parameters
+    ----------
+    state:
+        Shape (4,M), ordered as S_h, I_h, S_v, I_v.
+    x:
+        Spatial points, shape (M,).
+
+    Returns
+    -------
+    reaction:
+        Shape (4,M).
+    """
+    susceptible_humans = state[0]
+    infected_humans = state[1]
+    susceptible_vectors = state[2]
+    infected_vectors = state[3]
+
+    total_humans = susceptible_humans + infected_humans
+    total_humans = np.maximum(total_humans, 1.0e-14)
+
+    local = heterogeneous_parameters(x, parameters)
+
+    human_infections = (
+        local["beta_h"]
+        * susceptible_humans
+        * infected_vectors
+        / total_humans
+    )
+
+    vector_infections = (
+        local["beta_v"]
+        * susceptible_vectors
+        * infected_humans
+        / total_humans
+    )
+
+    d_susceptible_humans = (
+        local["Lambda_h"]
+        - human_infections
+        - parameters.mu_h * susceptible_humans
+        + parameters.gamma * infected_humans
+    )
+
+    d_infected_humans = (
+        human_infections
+        - (
+            parameters.gamma
+            + parameters.mu_h
+            + parameters.theta
+        )
+        * infected_humans
+    )
+
+    vector_death = parameters.mu_v + parameters.delta_v
+
+    d_susceptible_vectors = (
+        local["Lambda_v"]
+        - vector_infections
+        - vector_death * susceptible_vectors
+    )
+
+    d_infected_vectors = (
+        vector_infections
+        - vector_death * infected_vectors
+    )
+
+    return np.vstack(
+        [
+            d_susceptible_humans,
+            d_infected_humans,
+            d_susceptible_vectors,
+            d_infected_vectors,
+        ]
+    )
+
+
+# ---------------------------------------------------------------------
+# 5. Continuum differential operator
+# ---------------------------------------------------------------------
+
+def build_weighted_continuum_operator(
+    x: np.ndarray,
+) -> csr_matrix:
+    r"""
+    Construct a finite-volume approximation of
+
+        L_rho u = (1/rho) d/dx(rho du/dx)
+
+    with zero-flux boundary conditions.
+
+    The discretization is conservative with respect to the weighted
+    measure rho(x) dx. At interior grid point i,
+
+        (L_rho u)_i =
+            [F_(i+1/2) - F_(i-1/2)] / [rho_i dx],
+
+    where
+
+        F_(i+1/2) = rho_(i+1/2) (u_(i+1)-u_i)/dx.
+
+    Boundary fluxes are set to zero.
+    """
+    x = np.asarray(x)
+    number_of_points = len(x)
+
+    if number_of_points < 3:
+        raise ValueError("At least three continuum grid points are required.")
+
+    dx_values = np.diff(x)
+    if not np.allclose(dx_values, dx_values[0]):
+        raise ValueError("The continuum grid must be uniformly spaced.")
+
+    dx = dx_values[0]
+    density_at_nodes = rho(x)
+
+    # Harmonic mean is robust for variable-coefficient fluxes.
+    density_left = density_at_nodes[:-1]
+    density_right = density_at_nodes[1:]
+    density_at_faces = (
+        2.0
+        * density_left
+        * density_right
+        / np.maximum(density_left + density_right, 1.0e-14)
+    )
+
+    main_diagonal = np.zeros(number_of_points)
+    upper_diagonal = np.zeros(number_of_points - 1)
+    lower_diagonal = np.zeros(number_of_points - 1)
+
+    # Left boundary: zero flux at x = 0.
+    main_diagonal[0] = (
+        -density_at_faces[0]
+        / (density_at_nodes[0] * dx**2)
+    )
+    upper_diagonal[0] = (
+        density_at_faces[0]
+        / (density_at_nodes[0] * dx**2)
+    )
+
+    # Interior points.
+    for i in range(1, number_of_points - 1):
+        left_face = density_at_faces[i - 1]
+        right_face = density_at_faces[i]
+
+        lower_diagonal[i - 1] = (
+            left_face / (density_at_nodes[i] * dx**2)
+        )
+
+        main_diagonal[i] = (
+            -(left_face + right_face)
+            / (density_at_nodes[i] * dx**2)
+        )
+
+        upper_diagonal[i] = (
+            right_face / (density_at_nodes[i] * dx**2)
+        )
+
+    # Right boundary: zero flux at x = 1.
+    lower_diagonal[-1] = (
+        density_at_faces[-1]
+        / (density_at_nodes[-1] * dx**2)
+    )
+    main_diagonal[-1] = (
+        -density_at_faces[-1]
+        / (density_at_nodes[-1] * dx**2)
+    )
+
+    operator = diags(
+        diagonals=[lower_diagonal, main_diagonal, upper_diagonal],
+        offsets=[-1, 0, 1],
+        format="csr",
+    )
+
+    # Consistency check: constants should be annihilated.
+    constant_residual = operator @ np.ones(number_of_points)
+    if np.max(np.abs(constant_residual)) > 1.0e-9:
+        raise RuntimeError(
+            "Continuum operator does not annihilate constants."
+        )
+
+    return operator
+
+
+def continuum_rhs(
+    time: float,
+    flat_state: np.ndarray,
+    x: np.ndarray,
+    diffusion_operator: csr_matrix,
+    parameters: ModelParameters,
+) -> np.ndarray:
+    """Right-hand side of the continuum semi-discrete system."""
+    del time
+
+    number_of_points = len(x)
+    state = flat_state.reshape(4, number_of_points)
+
+    reaction = reaction_terms(state, x, parameters)
+
+    diffusion_coefficients = np.array(
+        [
+            parameters.m,
+            parameters.sigma,
+            parameters.nu,
+            parameters.nu,
+        ]
+    )
+
+    derivative = reaction.copy()
+
+    for compartment in range(4):
+        derivative[compartment] += (
+            diffusion_coefficients[compartment]
+            * (diffusion_operator @ state[compartment])
+        )
+
+    return derivative.ravel()
+
+
+def solve_continuum_model(
+    config: ExperimentConfig,
+    parameters: ModelParameters,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Solve Eq. (26) once on a fine reference grid.
+
+    Returns
+    -------
+    x:
+        Continuum grid.
+    final_state:
+        Continuum solution at final time, shape (4,M).
+    """
+    x = np.linspace(0.0, 1.0, config.continuum_points)
+    operator = build_weighted_continuum_operator(x)
+
+    initial_state = initial_condition(x, parameters)
+
+    result = solve_ivp(
+        fun=continuum_rhs,
+        t_span=(0.0, config.final_time),
+        y0=initial_state.ravel(),
+        args=(x, operator, parameters),
+        method=config.method,
+        rtol=config.rtol,
+        atol=config.atol,
+        t_eval=[config.final_time],
+    )
+
+    if not result.success:
+        raise RuntimeError(
+            f"Continuum solver failed: {result.message}"
+        )
+
+    final_state = result.y[:, -1].reshape(4, len(x))
+
+    if np.min(final_state) < -1.0e-5:
+        warnings.warn(
+            "The continuum solution contains negative values. "
+            "Refine the grid or tighten solver tolerances."
+        )
+
+    final_state = np.maximum(final_state, 0.0)
+
+    return x, final_state
+
+
+# ---------------------------------------------------------------------
+# 6. Density-corrected graph construction
+# ---------------------------------------------------------------------
+
+def gaussian_kernel(
+    scaled_distance: np.ndarray,
+) -> np.ndarray:
+    """Gaussian kernel K(z) = exp(-z^2/2)."""
+    return np.exp(-0.5 * scaled_distance**2)
+
+
+def build_density_corrected_random_walk(
+    nodes: np.ndarray,
+    epsilon: float,
+    alpha: float = 0.5,
+    cutoff_standard_deviations: float = 4.0,
+) -> Tuple[csr_matrix, np.ndarray]:
+    r"""
+    Build the density-corrected random-walk matrix.
+
+    Raw kernel:
+        W_ij = K((x_i-x_j)/sqrt(epsilon)).
+
+    Empirical kernel density:
+        q_i = sum_j W_ij.
+
+    Alpha-normalized weights:
+        Wtilde_ij = W_ij / (q_i^alpha q_j^alpha).
+
+    Random-walk matrix:
+        P_ij = Wtilde_ij / sum_k Wtilde_ik.
+
+    Notes
+    -----
+    1. Self-edges are retained. They do not affect P-I because the
+       diagonal contribution cancels in P u - u.
+    2. A distance cutoff is used only to produce a sparse matrix.
+       For four Gaussian standard deviations, omitted weights are tiny.
+    """
+    nodes = np.asarray(nodes)
+    number_of_nodes = len(nodes)
+    kernel_radius = cutoff_standard_deviations * np.sqrt(epsilon)
+
+    rows: List[int] = []
+    columns: List[int] = []
+    values: List[float] = []
+
+    left_index = 0
+    right_index = 0
+
+    for i in range(number_of_nodes):
+        while (
+            left_index < number_of_nodes
+            and nodes[i] - nodes[left_index] > kernel_radius
+        ):
+            left_index += 1
+
+        if right_index < i:
+            right_index = i
+
+        while (
+            right_index + 1 < number_of_nodes
+            and nodes[right_index + 1] - nodes[i] <= kernel_radius
+        ):
+            right_index += 1
+
+        neighborhood = np.arange(left_index, right_index + 1)
+        scaled_distance = (
+            nodes[i] - nodes[neighborhood]
+        ) / np.sqrt(epsilon)
+
+        weights = gaussian_kernel(scaled_distance)
+
+        rows.extend([i] * len(neighborhood))
+        columns.extend(neighborhood.tolist())
+        values.extend(weights.tolist())
+
+    raw_kernel = csr_matrix(
+        (values, (rows, columns)),
+        shape=(number_of_nodes, number_of_nodes),
+    )
+
+    # Symmetrize to suppress tiny cutoff-induced asymmetries.
+    raw_kernel = 0.5 * (raw_kernel + raw_kernel.T)
+
+    kernel_degree = np.asarray(raw_kernel.sum(axis=1)).ravel()
+    kernel_degree = np.maximum(kernel_degree, 1.0e-14)
+
+    correction = kernel_degree ** (-alpha)
+    correction_matrix = diags(correction)
+
+    corrected_weights = (
+        correction_matrix @ raw_kernel @ correction_matrix
+    ).tocsr()
+
+    corrected_degree = np.asarray(
+        corrected_weights.sum(axis=1)
+    ).ravel()
+    corrected_degree = np.maximum(corrected_degree, 1.0e-14)
+
+    transition_matrix = (
+        diags(1.0 / corrected_degree) @ corrected_weights
+    ).tocsr()
+
+    # Row-stochasticity check.
+    row_sums = np.asarray(transition_matrix.sum(axis=1)).ravel()
+    if np.max(np.abs(row_sums - 1.0)) > 1.0e-10:
+        raise RuntimeError(
+            "The graph transition matrix is not row stochastic."
+        )
+
+    return transition_matrix, kernel_degree
+
+
+def graph_generator(
+    transition_matrix: csr_matrix,
+    epsilon: float,
+    gaussian_kappa: float,
+) -> csr_matrix:
+    r"""
+    Construct the scaled graph generator
+
+        G_epsilon = (P-I)/(kappa_K epsilon),
+
+    which approximates
+
+        (1/rho) d/dx(rho d/dx)
+
+    under the normalization used in this experiment.
+    """
+    number_of_nodes = transition_matrix.shape[0]
+
+    generator = (
+        transition_matrix - eye(number_of_nodes, format="csr")
+    ) / (gaussian_kappa * epsilon)
+
+    # Constants must be annihilated.
+    residual = generator @ np.ones(number_of_nodes)
+    if np.max(np.abs(residual)) > 1.0e-9:
+        raise RuntimeError(
+            "Graph generator does not annihilate constants."
+        )
+
+    return generator
+
+
+# ---------------------------------------------------------------------
+# 7. Discrete graph malaria system
+# ---------------------------------------------------------------------
+
+def graph_rhs(
+    time: float,
+    flat_state: np.ndarray,
+    nodes: np.ndarray,
+    generator: csr_matrix,
+    parameters: ModelParameters,
+) -> np.ndarray:
+    """Right-hand side of the corrected discrete Eq. (25)."""
+    del time
+
+    number_of_nodes = len(nodes)
+    state = flat_state.reshape(4, number_of_nodes)
+
+    reaction = reaction_terms(state, nodes, parameters)
+
+    diffusion_coefficients = np.array(
+        [
+            parameters.m,
+            parameters.sigma,
+            parameters.nu,
+            parameters.nu,
+        ]
+    )
+
+    derivative = reaction.copy()
+
+    for compartment in range(4):
+        derivative[compartment] += (
+            diffusion_coefficients[compartment]
+            * (generator @ state[compartment])
+        )
+
+    return derivative.ravel()
+
+
+def build_jacobian_sparsity(generator: csr_matrix) -> csr_matrix:
+    """
+    Build the sparsity pattern of the graph right-hand side Jacobian.
+
+    The state is flattened as (compartment, node) in C order, i.e.
+    index = compartment * number_of_nodes + node. Two coupling
+    mechanisms contribute nonzero entries:
+
+      * Reaction terms couple all four compartments at the same node
+        (a dense 4x4 block per node).
+      * Diffusion terms couple a compartment at node i to the same
+        compartment at every node j for which generator[i, j] != 0.
+
+    Passing this pattern to ``solve_ivp`` lets SciPy estimate the
+    Jacobian with sparse finite differences instead of a dense
+    (4N x 4N) matrix, which otherwise scales quadratically in memory
+    and time with the number of nodes.
+    """
+    number_of_nodes = generator.shape[0]
+
+    reaction_pattern = kron(
+        np.ones((4, 4)), eye(number_of_nodes, format="csr"), format="csr"
+    )
+    diffusion_pattern = kron(
+        eye(4, format="csr"), generator.astype(bool), format="csr"
+    )
+
+    return (reaction_pattern + diffusion_pattern).astype(bool)
+
+
+def solve_graph_model(
+    nodes: np.ndarray,
+    epsilon: float,
+    config: ExperimentConfig,
+    parameters: ModelParameters,
+) -> Tuple[np.ndarray, csr_matrix]:
+    """Solve the discrete graph system at the sampled nodes."""
+    transition_matrix, _ = build_density_corrected_random_walk(
+        nodes=nodes,
+        epsilon=epsilon,
+        alpha=config.alpha,
+    )
+
+    generator = graph_generator(
+        transition_matrix=transition_matrix,
+        epsilon=epsilon,
+        gaussian_kappa=config.gaussian_kappa,
+    )
+
+    initial_state = initial_condition(nodes, parameters)
+
+    jac_sparsity = build_jacobian_sparsity(generator)
+
+    result = solve_ivp(
+        fun=graph_rhs,
+        t_span=(0.0, config.final_time),
+        y0=initial_state.ravel(),
+        args=(nodes, generator, parameters),
+        method=config.method,
+        rtol=config.rtol,
+        atol=config.atol,
+        t_eval=[config.final_time],
+        jac_sparsity=jac_sparsity,
+    )
+
+    if not result.success:
+        raise RuntimeError(
+            f"Graph solver failed: {result.message}"
+        )
+
+    final_state = result.y[:, -1].reshape(4, len(nodes))
+
+    if np.min(final_state) < -1.0e-5:
+        warnings.warn(
+            "The graph solution contains negative values. "
+            "Tighten solver tolerances or revise the numerical method."
+        )
+
+    final_state = np.maximum(final_state, 0.0)
+
+    return final_state, generator
+
+
+# ---------------------------------------------------------------------
+# 8. Error measures and diagnostics
+# ---------------------------------------------------------------------
+
+COMPARTMENT_NAMES = ("S_h", "I_h", "S_v", "I_v")
+
+
+def interpolate_continuum_to_nodes(
+    continuum_x: np.ndarray,
+    continuum_state: np.ndarray,
+    nodes: np.ndarray,
+) -> np.ndarray:
+    """Interpolate the continuum reference solution to graph nodes."""
+    values = np.empty((4, len(nodes)))
+
+    for compartment in range(4):
+        interpolator = PchipInterpolator(
+            continuum_x,
+            continuum_state[compartment],
+            extrapolate=False,
+        )
+        values[compartment] = interpolator(nodes)
+
+    return values
+
+
+def weighted_relative_l2_error(
+    approximation: np.ndarray,
+    reference: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> float:
+    """
+    Relative weighted L2 error.
+
+    If graph nodes are sampled from rho, equal Monte Carlo weights
+    approximate the L2(rho dx) norm.
+    """
+    if weights is None:
+        weights = np.full(reference.size, 1.0 / reference.size)
+
+    numerator = np.sum(weights * (approximation - reference) ** 2)
+    denominator = np.sum(weights * reference**2)
+
+    return np.sqrt(numerator / max(denominator, 1.0e-30))
+
+
+def relative_linf_error(
+    approximation: np.ndarray,
+    reference: np.ndarray,
+) -> float:
+    """Relative maximum-norm error."""
+    numerator = np.max(np.abs(approximation - reference))
+    denominator = np.max(np.abs(reference))
+
+    return numerator / max(denominator, 1.0e-30)
+
+
+def estimate_spectral_gap(generator: csr_matrix) -> float:
+    """
+    Estimate the magnitude of the first nonzero generator eigenvalue.
+
+    This is an optional graph diagnostic. The largest eigenvalue should
+    be approximately zero, and the second largest should be negative.
+    """
+    try:
+        eigenvalues = eigs(
+            generator,
+            k=2,
+            which="LR",
+            return_eigenvectors=False,
+        )
+        eigenvalues = np.sort(np.real(eigenvalues))[::-1]
+        return abs(eigenvalues[1])
+    except Exception:
+        return np.nan
+
+
+def epsilon_from_n(
+    number_of_nodes: int,
+    config: ExperimentConfig,
+) -> float:
+    """Bandwidth schedule epsilon_N."""
+    return (
+        config.epsilon_prefactor
+        * number_of_nodes ** (-config.epsilon_power)
+    )
+
+
+# ---------------------------------------------------------------------
+# 9. Full convergence experiment
+# ---------------------------------------------------------------------
+
+def run_convergence_experiment(
+    config: ExperimentConfig,
+    parameters: ModelParameters,
+) -> pd.DataFrame:
+    """
+    Run all graph sizes and random repetitions.
+
+    The continuum solution is computed only once because the continuum
+    model does not depend on N or the graph realization.
+    """
+    print("Solving the continuum reference problem...")
+    continuum_x, continuum_final = solve_continuum_model(
+        config=config,
+        parameters=parameters,
+    )
+
+    records: List[Dict[str, float]] = []
+
+    for number_of_nodes in config.node_counts:
+        epsilon = epsilon_from_n(number_of_nodes, config)
+
+        # Useful asymptotic sampling diagnostic in one dimension.
+        effective_neighbors_scale = (
+            number_of_nodes * np.sqrt(epsilon)
+        )
+
+        print(
+            f"\nN={number_of_nodes:5d}, "
+            f"epsilon={epsilon:.6e}, "
+            f"N*sqrt(epsilon)={effective_neighbors_scale:.3f}"
+        )
+
+        for repetition in range(config.repetitions):
+            seed = (
+                config.random_seed
+                + 100_000 * number_of_nodes
+                + repetition
+            )
+            rng = np.random.default_rng(seed)
+
+            nodes = sample_nodes_from_density(
+                number_of_nodes=number_of_nodes,
+                rng=rng,
+            )
+
+            graph_final, generator = solve_graph_model(
+                nodes=nodes,
+                epsilon=epsilon,
+                config=config,
+                parameters=parameters,
+            )
+
+            continuum_at_nodes = interpolate_continuum_to_nodes(
+                continuum_x=continuum_x,
+                continuum_state=continuum_final,
+                nodes=nodes,
+            )
+
+            spectral_gap = estimate_spectral_gap(generator)
+
+            for compartment, name in enumerate(COMPARTMENT_NAMES):
+                l2_error = weighted_relative_l2_error(
+                    approximation=graph_final[compartment],
+                    reference=continuum_at_nodes[compartment],
+                )
+
+                linf_error = relative_linf_error(
+                    approximation=graph_final[compartment],
+                    reference=continuum_at_nodes[compartment],
+                )
+
+                records.append(
+                    {
+                        "N": number_of_nodes,
+                        "epsilon": epsilon,
+                        "N_sqrt_epsilon": effective_neighbors_scale,
+                        "repetition": repetition,
+                        "seed": seed,
+                        "compartment": name,
+                        "relative_L2_error": l2_error,
+                        "relative_Linf_error": linf_error,
+                        "spectral_gap": spectral_gap,
+                    }
+                )
+
+            print(
+                f"  repetition {repetition + 1:2d}/"
+                f"{config.repetitions}: "
+                f"I_h L2 error = "
+                f"{records[-3]['relative_L2_error']:.4e}"
+            )
+
+    return pd.DataFrame.from_records(records)
+
+
+# ---------------------------------------------------------------------
+# 10. Summaries and empirical convergence rates
+# ---------------------------------------------------------------------
+
+def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
+    """Calculate means and sample standard deviations."""
+    summary = (
+        results.groupby(["N", "epsilon", "compartment"], as_index=False)
+        .agg(
+            mean_L2_error=("relative_L2_error", "mean"),
+            sd_L2_error=("relative_L2_error", "std"),
+            mean_Linf_error=("relative_Linf_error", "mean"),
+            sd_Linf_error=("relative_Linf_error", "std"),
+            mean_spectral_gap=("spectral_gap", "mean"),
+            N_sqrt_epsilon=("N_sqrt_epsilon", "first"),
+        )
+    )
+
+    return summary
+
+
+def estimate_convergence_rates(
+    summary: pd.DataFrame,
+) -> pd.DataFrame:
+    r"""
+    Estimate empirical rates from
+
+        error approximately C N^(-p)
+
+    and
+
+        error approximately C epsilon^q.
+
+    Because epsilon is itself a function of N, the two fitted exponents
+    are not statistically independent. Both are reported for convenient
+    interpretation.
+    """
+    records: List[Dict[str, float]] = []
+
+    for compartment in COMPARTMENT_NAMES:
+        subset = (
+            summary[summary["compartment"] == compartment]
+            .sort_values("N")
+        )
+
+        log_n = np.log(subset["N"].to_numpy(dtype=float))
+        log_epsilon = np.log(
+            subset["epsilon"].to_numpy(dtype=float)
+        )
+
+        for error_column in ("mean_L2_error", "mean_Linf_error"):
+            error = subset[error_column].to_numpy(dtype=float)
+            log_error = np.log(np.maximum(error, 1.0e-30))
+
+            slope_n, intercept_n = np.polyfit(
+                log_n,
+                log_error,
+                1,
+            )
+
+            slope_epsilon, intercept_epsilon = np.polyfit(
+                log_epsilon,
+                log_error,
+                1,
+            )
+
+            records.append(
+                {
+                    "compartment": compartment,
+                    "error_norm": error_column,
+                    "rate_in_N": -slope_n,
+                    "rate_in_epsilon": slope_epsilon,
+                    "constant_N_fit": np.exp(intercept_n),
+                    "constant_epsilon_fit": np.exp(
+                        intercept_epsilon
+                    ),
+                }
+            )
+
+    return pd.DataFrame.from_records(records)
+
+
+# ---------------------------------------------------------------------
+# 11. Plots
+# ---------------------------------------------------------------------
+
+def plot_error_convergence(
+    summary: pd.DataFrame,
+    output_directory: Path,
+) -> None:
+    """Plot relative L2 errors against N."""
+    fig, axis = plt.subplots(figsize=(7.0, 5.2))
+
+    for compartment in COMPARTMENT_NAMES:
+        subset = (
+            summary[summary["compartment"] == compartment]
+            .sort_values("N")
+        )
+
+        standard_deviation = (
+            subset["sd_L2_error"]
+            .fillna(0.0)
+            .to_numpy()
+        )
+
+        axis.errorbar(
+            subset["N"],
+            subset["mean_L2_error"],
+            yerr=standard_deviation,
+            marker="o",
+            capsize=3,
+            label=compartment,
+        )
+
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlabel("Number of graph nodes, N")
+    axis.set_ylabel("Relative weighted L2 error")
+    axis.set_title("Discrete-to-continuum convergence")
+    axis.grid(True, which="both", alpha=0.3)
+    axis.legend()
+    fig.tight_layout()
+
+    fig.savefig(
+        output_directory / "relative_L2_convergence.png",
+        dpi=300,
+    )
+    plt.close(fig)
+
+
+def plot_error_against_epsilon(
+    summary: pd.DataFrame,
+    output_directory: Path,
+) -> None:
+    """Plot relative L2 errors against epsilon."""
+    fig, axis = plt.subplots(figsize=(7.0, 5.2))
+
+    for compartment in COMPARTMENT_NAMES:
+        subset = (
+            summary[summary["compartment"] == compartment]
+            .sort_values("epsilon")
+        )
+
+        standard_deviation = (
+            subset["sd_L2_error"]
+            .fillna(0.0)
+            .to_numpy()
+        )
+
+        axis.errorbar(
+            subset["epsilon"],
+            subset["mean_L2_error"],
+            yerr=standard_deviation,
+            marker="o",
+            capsize=3,
+            label=compartment,
+        )
+
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_xlabel("Kernel bandwidth parameter, epsilon")
+    axis.set_ylabel("Relative weighted L2 error")
+    axis.set_title("Error versus kernel bandwidth")
+    axis.grid(True, which="both", alpha=0.3)
+    axis.legend()
+    fig.tight_layout()
+
+    fig.savefig(
+        output_directory / "error_against_epsilon.png",
+        dpi=300,
+    )
+    plt.close(fig)
+
+
+def plot_solution_comparison(
+    number_of_nodes: int,
+    config: ExperimentConfig,
+    parameters: ModelParameters,
+    output_directory: Path,
+) -> None:
+    """
+    Plot one representative graph solution against the continuum result.
+    """
+    continuum_x, continuum_final = solve_continuum_model(
+        config=config,
+        parameters=parameters,
+    )
+
+    epsilon = epsilon_from_n(number_of_nodes, config)
+    rng = np.random.default_rng(config.random_seed + number_of_nodes)
+    nodes = sample_nodes_from_density(number_of_nodes, rng)
+
+    graph_final, _ = solve_graph_model(
+        nodes=nodes,
+        epsilon=epsilon,
+        config=config,
+        parameters=parameters,
+    )
+
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(11.0, 7.5),
+        sharex=True,
+    )
+    axes = axes.ravel()
+
+    for compartment, axis in enumerate(axes):
+        axis.plot(
+            continuum_x,
+            continuum_final[compartment],
+            linewidth=2.0,
+            color="tab:blue",
+            label="Continuum",
+        )
+        axis.scatter(
+            nodes,
+            graph_final[compartment],
+            s=10,
+            alpha=0.55,
+            color="tab:orange",
+            label="Graph (discrete)",
+        )
+        axis.set_title(COMPARTMENT_NAMES[compartment])
+        axis.grid(True, alpha=0.25)
+
+    axes[0].legend()
+    axes[2].set_xlabel("Spatial position")
+    axes[3].set_xlabel("Spatial position")
+    axes[0].set_ylabel("Population")
+    axes[2].set_ylabel("Population")
+
+    fig.suptitle(
+        f"Graph and continuum solutions at T={config.final_time:g}, "
+        f"N={number_of_nodes}, epsilon={epsilon:.3e}"
+    )
+    fig.tight_layout()
+
+    fig.savefig(
+        output_directory / f"solution_comparison_N{number_of_nodes}.png",
+        dpi=300,
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------
+# 12. Main program
+# ---------------------------------------------------------------------
+
+def main() -> None:
+    parameters = ModelParameters()
+    config = ExperimentConfig()
+
+    output_directory = Path(config.output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    results = run_convergence_experiment(
+        config=config,
+        parameters=parameters,
+    )
+
+    summary = summarize_results(results)
+    rates = estimate_convergence_rates(summary)
+
+    results.to_csv(
+        output_directory / "all_realizations.csv",
+        index=False,
+    )
+    summary.to_csv(
+        output_directory / "convergence_summary.csv",
+        index=False,
+    )
+    rates.to_csv(
+        output_directory / "empirical_rates.csv",
+        index=False,
+    )
+
+    plot_error_convergence(
+        summary=summary,
+        output_directory=output_directory,
+    )
+
+    plot_error_against_epsilon(
+        summary=summary,
+        output_directory=output_directory,
+    )
+
+    plot_solution_comparison(
+        number_of_nodes=max(config.node_counts),
+        config=config,
+        parameters=parameters,
+        output_directory=output_directory,
+    )
+
+    print("\nMean convergence errors")
+    print(
+        summary[
+            [
+                "N",
+                "epsilon",
+                "compartment",
+                "mean_L2_error",
+                "sd_L2_error",
+                "mean_Linf_error",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\nEstimated convergence rates")
+    print(rates.to_string(index=False))
+
+    print(
+        f"\nResults saved in: {output_directory.resolve()}"
+    )
+
+
+if __name__ == "__main__":
+    main()
