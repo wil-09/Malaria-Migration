@@ -1,0 +1,726 @@
+"""graph_to_continuum_upgraded_ER.py
+
+Upgraded reproducible convergence suite for the discrete graph malaria model
+    dS_hi/dt = Lambda_hi - beta_hi*I_vi*S_hi/(S_hi+I_hi) - mu_hi*S_hi + gamma*I_hi
+               - (m0/eps)  * sum_j P_ij (S_hi - S_hj)
+    dI_hi/dt = beta_hi*I_vi*S_hi/(S_hi+I_hi) - (gamma+mu_hi+theta)*I_hi
+               - (sigma0/eps) * sum_j P_ij (I_hi - I_hj)
+    dS_vi/dt = Lambda_vi - beta_vi*I_hi*S_vi/(S_hi+I_hi) - mu_v*S_vi
+               - (nu0/eps) * sum_j P_ij (S_vi - S_vj)
+    dI_vi/dt = beta_vi*I_hi*S_vi/(S_hi+I_hi) - mu_v*I_vi
+               - (nu0/eps) * sum_j P_ij (I_vi - I_vj)
+
+and its continuum reaction-diffusion limit (N -> infinity, eps -> 0)
+    dS_h/dt = Lambda_h - beta_h*S_h*I_v/(S_h+I_h) - mu_h*S_h + gamma*I_h
+              + m  * (S_h_xx + 2*(1-alpha)*(rho_x/rho)*S_h_x)
+    dI_h/dt = beta_h*S_h*I_v/(S_h+I_h) - (gamma+mu_h+theta)*I_h
+              + sigma * (I_h_xx + 2*(1-alpha)*(rho_x/rho)*I_h_x)
+    dS_v/dt = Lambda_v - beta_v*S_v*I_h/(S_h+I_h) - mu_v*S_v
+              + nu * (S_v_xx + 2*(1-alpha)*(rho_x/rho)*S_v_x)
+    dI_v/dt = beta_v*S_v*I_h/(S_h+I_h) - mu_v*I_v
+              + nu * (I_v_xx + 2*(1-alpha)*(rho_x/rho)*I_v_x)
+
+where rho(x) is the sampling density of the graph nodes and eps is the
+Gaussian-kernel bandwidth used for the edge weights. The geometric graph
+connects the closest pairs up to a radius giving mean degree 40. Within
+that radius, K_eps(x,y) = exp(-d_T(x,y)^2/(4 eps)), q_i = sum_j K_ij,
+K_alpha,ij = K_ij/(q_i^alpha q_j^alpha), and P = D_alpha^{-1} K_alpha,
+the graph generator L_G = (P-I)/eps targets
+u_xx + 2(1-alpha)(rho_x/rho)u_x under the usual local-kernel scaling.
+The requested fixed mean degree of 40 is retained for every graph size;
+therefore these convergence and consistency experiments are empirical
+diagnostics at fixed degree, not an asymptotic consistency guarantee.
+The node-dependent demographic and transmission coefficients are evaluated
+at each node's sampled location x_i (and at continuum grid locations for
+the reference system).
+
+Upgrades over graph_to_continuum_malaria.py
+--------------------------------------------
+1. Sparse, periodic-KD-tree kernel-weighted random geometric graph with
+   mean degree 40.
+2. Explicit sparsity pattern supplied to the stiff BDF solver for the
+   full nonlinear system, which substantially speeds up the Jacobian
+   estimation used internally by scipy.
+3. Each of the eight requested convergence checks is implemented as its
+   own clearly named, independently callable function instead of being
+   folded together.
+4. Every empirical error trend is summarized with a weighted log-log
+   least-squares regression (slope + R^2) and checked against an
+   explicit, numeric acceptance threshold, producing a machine-readable
+   verdict.json pass/fail report in addition to the raw results.
+5. The mesh-refinement reference test uses a Richardson-extrapolated
+   two-mesh continuum solution rather than a single fixed fine mesh.
+6. The stochastic-variability test reports an explicit 95% confidence
+   interval (mean +/- 1.96*std/sqrt(reps)) instead of only mean/std.
+7. A consolidated 2x4 diagnostic figure covers all eight tests.
+
+Run:
+    python graph_to_continuum_upgraded_ER.py --mode quick
+    python graph_to_continuum_upgraded_ER.py --mode full --out results_full
+    python graph_to_continuum_upgraded_ER.py --mode quick --alphas 0 0.5 1
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from scipy.integrate import solve_ivp
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+
+TWOPI = 2 * np.pi
+TARGET_AVERAGE_DEGREE = 40
+
+
+# ---------------------------------------------------------------------
+# Sampling density rho(x) on the periodic unit interval
+# ---------------------------------------------------------------------
+def rho(x):
+    return 1.0 + 0.35 * np.sin(TWOPI * x)
+
+
+def rho_x(x):
+    return 0.35 * TWOPI * np.cos(TWOPI * x)
+
+
+def sample_rho(n, rng):
+    """Inverse-CDF sampling of n nodes from rho on [0,1)."""
+    z = np.linspace(0, 1, 20001)
+    c = z + 0.35 * (1 - np.cos(TWOPI * z)) / TWOPI
+    c /= c[-1]
+    return np.sort(np.interp(rng.random(n), c, z))
+
+
+# ---------------------------------------------------------------------
+# Sparse kernel-weighted random geometric graph
+# ---------------------------------------------------------------------
+def graph_matrix_sparse(
+    x,
+    eps,
+    tol=1e-13,
+    alpha=0.0,
+    target_degree=TARGET_AVERAGE_DEGREE,
+):
+    """Build an alpha-normalized kernel-weighted geometric graph.
+
+    Undirected edges join the closest periodic node pairs up to a radius
+    chosen to give the requested mean degree. Gaussian kernel weights
+    are assigned to those edges, then alpha-normalized and row-normalized.
+    The returned graph is spatially local and kernel weighted.
+
+    ``tol`` is retained for compatibility with the earlier truncated-kernel
+    constructor; the edge count now determines graph truncation.
+    """
+    if not np.isfinite(alpha):
+        raise ValueError("The normalization parameter alpha must be finite.")
+    if not np.isfinite(eps) or eps <= 0:
+        raise ValueError("The kernel bandwidth eps must be finite and positive.")
+    n = len(x)
+    if n < 2:
+        raise ValueError("At least two nodes are required to build a graph.")
+    if not isinstance(target_degree, (int, np.integer)) or target_degree < 1:
+        raise ValueError("target_degree must be a positive integer.")
+    if target_degree >= n:
+        raise ValueError(
+            f"target_degree must be less than the number of nodes ({n})."
+        )
+
+    tree = cKDTree((x % 1.0)[:, None], boxsize=1.0)
+    nearest_distances, _ = tree.query(
+        (x % 1.0)[:, None],
+        k=target_degree + 1,
+    )
+    radius = min(0.5, 1.5 * float(np.median(nearest_distances[:, -1])))
+    target_edge_count = int(round(n * target_degree / 2))
+
+    pairs = tree.query_pairs(r=radius, output_type="ndarray")
+    while len(pairs) < target_edge_count and radius < 0.5:
+        radius = min(0.5, 1.5 * radius)
+        pairs = tree.query_pairs(r=radius, output_type="ndarray")
+    if len(pairs) < target_edge_count:
+        raise RuntimeError(
+            "Unable to find enough geometric edges for the requested degree."
+        )
+
+    i, j = pairs[:, 0], pairs[:, 1]
+    dx = np.abs(x[i] - x[j])
+    dx = np.minimum(dx, 1 - dx)
+    selected_edges = np.argpartition(
+        dx, target_edge_count - 1
+    )[:target_edge_count]
+    i = i[selected_edges]
+    j = j[selected_edges]
+    dx = dx[selected_edges]
+    w = np.exp(-(dx ** 2) / (4 * eps))
+    rows = np.concatenate([i, j])
+    cols = np.concatenate([j, i])
+    vals = np.concatenate([w, w])
+    K = sp.csr_matrix((vals, (rows, cols)), shape=(n, n))
+    kernel_degree = np.asarray(K.sum(1)).ravel()
+    if kernel_degree.min() < 1e-14:
+        raise ValueError(
+            "The geometric graph contains an isolated node; increase the "
+            "target degree or graph size."
+        )
+    correction = kernel_degree ** (-alpha)
+    corrected = (
+        sp.diags(correction) @ K @ sp.diags(correction)
+    ).tocsr()
+    corrected_degree = np.asarray(corrected.sum(1)).ravel()
+    P = sp.diags(1.0 / corrected_degree) @ corrected
+    pi = corrected_degree / corrected_degree.sum()
+    del tol
+    return P.tocsr(), pi, corrected_degree
+
+
+def L_graph(P, eps):
+    n = P.shape[0]
+    return ((P - sp.eye(n, format="csr")) / eps).tocsr()
+
+
+# ---------------------------------------------------------------------
+# Continuum spatial operator: conservative periodic finite-volume form
+# of w_alpha^-1 d_x(w_alpha d_x u), w_alpha = rho^(2(1-alpha)).
+# ---------------------------------------------------------------------
+def L_continuum_matrix(M, alpha=0.0):
+    if not np.isfinite(alpha):
+        raise ValueError("The normalization parameter alpha must be finite.")
+    x = np.arange(M) / M
+    h = 1.0 / M
+    weight = rho(x) ** (2.0 * (1.0 - alpha))
+    weight_face = 0.5 * (weight + np.roll(weight, -1))
+    right = weight_face / (weight * h * h)
+    left = np.roll(weight_face, 1) / (weight * h * h)
+    diag = -(right + left)
+    idx = np.arange(M)
+    data = np.concatenate([diag, right, left])
+    rows = np.concatenate([idx, idx, idx])
+    cols = np.concatenate([idx, (idx + 1) % M, (idx - 1) % M])
+    L = sp.csr_matrix((data, (rows, cols)), shape=(M, M))
+    return x, L
+
+
+def interp_periodic(xg, u, x):
+    return np.interp(np.mod(x, 1), np.r_[xg, 1.0], np.r_[u, u[0]])
+
+
+def test_functions(x):
+    return [np.sin(TWOPI * x), np.cos(2 * TWOPI * x) + 0.2 * np.sin(4 * TWOPI * x)]
+
+
+def exact_continuum_operator(f_id, x, alpha=0.0):
+    q = 2.0 * (1.0 - alpha) * rho_x(x) / rho(x)
+    if f_id == 0:
+        return -(TWOPI ** 2) * np.sin(TWOPI * x) + q * TWOPI * np.cos(TWOPI * x)
+    return (
+        -((2 * TWOPI) ** 2) * np.cos(2 * TWOPI * x)
+        - 0.2 * (4 * TWOPI) ** 2 * np.sin(4 * TWOPI * x)
+        + q * (-2 * TWOPI * np.sin(2 * TWOPI * x) + 0.8 * TWOPI * np.cos(4 * TWOPI * x))
+    )
+
+
+def wnorm(v, w):
+    return float(np.sqrt(np.sum(w * v * v) / np.sum(w)))
+
+
+def loglog_regression(ns, errs):
+    """Weighted-free log-log least-squares fit, returns slope, intercept, R^2."""
+    ns   = np.asarray(ns, dtype=float)
+    errs = np.asarray(errs, dtype=float)
+    mask = errs > 0
+    ln_n, ln_e = np.log(ns[mask]), np.log(errs[mask])
+    slope, intercept = np.polyfit(ln_n, ln_e, 1)
+    pred = slope * ln_n + intercept
+    ss_res = np.sum((ln_e - pred) ** 2)
+    ss_tot = np.sum((ln_e - ln_e.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return dict(slope=float(slope), intercept=float(intercept), r2=float(r2))
+
+
+# ---------------------------------------------------------------------
+# Malaria-system parameters, coefficients, initial data (shared by both
+# the graph and the continuum model so the comparison is apples-to-apples)
+# ---------------------------------------------------------------------
+@dataclass
+class Par:
+    gamma  : float = 5.5e-4
+    theta  : float = 1.0e-5
+    mu_v   : float = 0.033
+    m0     : float = 2.0e-4
+    sigma0 : float = 2.0e-4
+    nu0    : float = 2.0e-8
+
+
+def coeffs(x):
+    return dict(
+        Lh  = 0.033 * (1 + 0.12 * np.cos(TWOPI * x)),
+        Lv  = 0.13  * (1 + 0.10 * np.sin(TWOPI * x)),
+        bh  = 0.022  * (1 + 0.08 * np.sin(TWOPI * x)),
+        bv  = 0.44  * (1 + 0.08 * np.cos(TWOPI * x)),
+        muh = 1.6e-5 * (1 + 0.10 * np.cos(TWOPI * x)),
+        muv = 0.033  * (1 + 0.10 * np.cos(TWOPI * x)),
+    )
+
+
+def initial(x):
+    bump = np.exp(-((np.minimum(np.abs(x - 0.32), 1 - np.abs(x - 0.32))) / 0.09) ** 2)
+    Ih = 0.035 + 0.018 * bump
+    Iv = 0.05 + 0.025 * bump
+    return np.r_[1.7 + 0.12 * np.cos(TWOPI * x), Ih, 2.1 + 0.10 * np.sin(TWOPI * x), Iv]
+
+
+def rhs_factory(x, L, p):
+    n = len(x)
+    c = coeffs(x)
+
+    def rhs(t, y):
+        Sh, Ih, Sv, Iv = y.reshape(4, n)
+        den = np.maximum(Sh + Ih, 1e-12)
+        infh = c["bh"] * Iv * Sh / den
+        infv = c["bv"] * Ih * Sv / den
+        return np.r_[
+            c["Lh"] - infh - c["muh"] * Sh + p.gamma * Ih + p.m0 * np.asarray(L @ Sh).ravel(),
+            infh - (p.gamma + c["muh"] + p.theta) * Ih + p.sigma0 * np.asarray(L @ Ih).ravel(),
+            c["Lv"] - infv - p.mu_v * Sv + p.nu0 * np.asarray(L @ Sv).ravel(),
+            infv - p.mu_v * Iv + p.nu0 * np.asarray(L @ Iv).ravel(),
+        ]
+
+    return rhs
+
+
+def jac_sparsity_pattern(L):
+    """Block sparsity pattern for the 4 coupled fields: local (same-node,
+    cross-field) coupling from the reaction terms plus per-field transport
+    coupling from the graph/continuum operator L."""
+    n = L.shape[0]
+    Lb = L.copy()
+    Lb.data[:] = 1.0
+    local = sp.kron(sp.csr_matrix(np.ones((4, 4))), sp.eye(n, format="csr"))
+    transport = sp.block_diag([Lb, Lb, Lb, Lb], format="csr")
+    pattern = (local + transport).tocsr()
+    pattern.data[:] = 1.0
+    return pattern
+
+
+def solve_system(x, L, T, p, rtol=2e-7, atol=2e-9, use_sparsity=True):
+    n = len(x)
+    jac_sparsity = jac_sparsity_pattern(L) if use_sparsity else None
+    sol = solve_ivp(
+        rhs_factory(x, L, p), (0, T), initial(x), method="BDF",
+        rtol=rtol, atol=atol, t_eval=[T], jac_sparsity=jac_sparsity,
+    )
+    if not sol.success:
+        raise RuntimeError(sol.message)
+    return sol.y[:, -1].reshape(4, n)
+
+
+# ---------------------------------------------------------------------
+# Test 1: graph construction conservation
+# ---------------------------------------------------------------------
+def test1_graph_construction_conservation(N, eps, seed, alpha=0.0):
+    rng = np.random.default_rng(seed)
+    x = sample_rho(N, rng)
+    P, pi, _ = graph_matrix_sparse(x, eps, alpha=alpha)
+    L = L_graph(P, eps)
+    mean_degree = float(np.diff(P.indptr).mean())
+    ones = np.ones(N)
+    generator_null_residual = float(np.max(np.abs(np.asarray(L @ ones).ravel())))
+    row_stochastic_residual = float(
+        np.max(np.abs(np.asarray(P.sum(1)).ravel() - 1.0))
+    )
+    f = rng.normal(size=N)
+    stationary_mass_residual = float(abs(pi @ np.asarray(L @ f).ravel()))
+    return dict(
+        test="graph_construction_conservation", alpha=alpha, N=N, eps=eps,
+        mean_degree=mean_degree,
+        generator_null_residual=generator_null_residual,
+        row_stochastic_residual=row_stochastic_residual,
+        stationary_mass_residual=stationary_mass_residual,
+    )
+
+
+# ---------------------------------------------------------------------
+# Test 2: forward-backward equivalence (detailed balance + adjointness)
+# ---------------------------------------------------------------------
+def test2_forward_backward_equivalence(N, eps, seed, alpha=0.0):
+    rng = np.random.default_rng(seed)
+    x = sample_rho(N, rng)
+    P, pi, _ = graph_matrix_sparse(x, eps, alpha=alpha)
+    L = L_graph(P, eps)
+    M = (sp.diags(pi) @ P).toarray()
+    detailed_balance_residual = float(np.max(np.abs(M - M.T)))
+    f = rng.normal(size=N)
+    g = rng.normal(size=N)
+    Lf = np.asarray(L @ f).ravel()
+    Lg = np.asarray(L @ g).ravel()
+    adjoint_residual = abs(np.sum(pi * f * Lg) - np.sum(pi * Lf * g))
+    adjoint_relative = adjoint_residual / max(float(np.sum(np.abs(pi * f * Lg))), 1e-15)
+    forward_density = np.asarray(L.T @ (pi * f)).ravel()
+    backward_then_weight = pi * Lf
+    fb_relative = float(
+        np.linalg.norm(forward_density - backward_then_weight)
+        / max(np.linalg.norm(backward_then_weight), 1e-15)
+    )
+    return dict(
+        test="forward_backward_equivalence", alpha=alpha, N=N, eps=eps,
+        detailed_balance_residual=detailed_balance_residual,
+        adjoint_relative=float(adjoint_relative),
+        forward_backward_relative=fb_relative,
+    )
+
+
+# ---------------------------------------------------------------------
+# Test 3: operator consistency (graph generator vs. analytic PDE operator)
+# ---------------------------------------------------------------------
+def test3_operator_consistency(N, eps, seed, alpha=0.0):
+    rng = np.random.default_rng(seed)
+    x = sample_rho(N, rng)
+    P, pi, _ = graph_matrix_sparse(x, eps, alpha=alpha)
+    L = L_graph(P, eps)
+    errs = []
+    for k, f in enumerate(test_functions(x)):
+        errs.append(wnorm(
+            np.asarray(L @ f).ravel()
+            - exact_continuum_operator(k, x, alpha=alpha),
+            pi,
+        ))
+    return dict(test="operator_consistency", alpha=alpha, N=N, eps=eps, error=max(errs), error_mean=float(np.mean(errs)))
+
+
+# ---------------------------------------------------------------------
+# Test 4: pure transport convergence (graph diffusion vs. continuum FV)
+# ---------------------------------------------------------------------
+def test4_pure_transport_convergence(N, eps, seed, T=0.04, D=0.02, Mref=512, alpha=0.0):
+    rng = np.random.default_rng(seed)
+    x = sample_rho(N, rng)
+    P, pi, _ = graph_matrix_sparse(x, eps, alpha=alpha)
+    Lg = L_graph(P, eps)
+    xg, Lc = L_continuum_matrix(Mref, alpha=alpha)
+    u0 = lambda z: np.sin(TWOPI * z) + 0.3 * np.cos(4 * TWOPI * z)
+    yg = solve_ivp(lambda t, u: D * np.asarray(Lg @ u).ravel(), (0, T), u0(x),
+                    method="BDF", rtol=2e-8, atol=2e-10, t_eval=[T]).y[:, -1]
+    yc = solve_ivp(lambda t, u: D * np.asarray(Lc @ u).ravel(), (0, T), u0(xg),
+                    method="BDF", rtol=2e-8, atol=2e-10, t_eval=[T]).y[:, -1]
+    err = wnorm(yg - interp_periodic(xg, yc, x), pi)
+    return dict(test="pure_transport", alpha=alpha, N=N, eps=eps, error=err)
+
+
+# ---------------------------------------------------------------------
+# Test 5: full nonlinear malaria-system convergence
+# ---------------------------------------------------------------------
+def test5_full_nonlinear_convergence(N, eps, seed, T=0.35, Mref=512, alpha=0.0):
+    p = Par()
+    rng = np.random.default_rng(seed)
+    x = sample_rho(N, rng)
+    P, pi, _ = graph_matrix_sparse(x, eps, alpha=alpha)
+    Lg = L_graph(P, eps)
+    yg = solve_system(x, Lg, T, p)
+    xg, Lc = L_continuum_matrix(Mref, alpha=alpha)
+    yc = solve_system(xg, Lc, T, p, rtol=1e-8, atol=1e-10)
+    e = [wnorm(yg[k] - interp_periodic(xg, yc[k], x), pi) for k in range(4)]
+    return dict(test="full_nonlinear", alpha=alpha, N=N, eps=eps, error=max(e), Sh=e[0], Ih=e[1], Sv=e[2], Iv=e[3])
+
+
+# ---------------------------------------------------------------------
+# Test 6: bandwidth robustness -- thin wrapper around test 3 at varying eps
+# ---------------------------------------------------------------------
+def test6_bandwidth_robustness(N, eps, seed, alpha=0.0):
+    row = test3_operator_consistency(N, eps, seed, alpha=alpha)
+    row["test"] = "bandwidth_robustness"
+    return row
+
+
+# ---------------------------------------------------------------------
+# Test 7: stochastic variability -- repeated independent node samples
+# ---------------------------------------------------------------------
+def test7_stochastic_variability_from_errors(N, eps, errors):
+    errors = np.asarray(errors, dtype=float)
+    reps = len(errors)
+    mean = float(errors.mean())
+    std = float(errors.std(ddof=1)) if reps > 1 else 0.0
+    ci95 = 1.96 * std / np.sqrt(reps) if reps > 1 else 0.0
+    return dict(test="stochastic_variability", N=N, eps=eps, reps=reps, mean=mean, std=std, ci95=ci95)
+
+
+# ---------------------------------------------------------------------
+# Test 8: numerical-reference accuracy -- Richardson-extrapolated reference
+# ---------------------------------------------------------------------
+def richardson_reference(T=0.04, D=0.02, M1=2048, M2=4096, order=2.0, alpha=0.0):
+    u0 = lambda z: np.sin(TWOPI * z) + 0.3 * np.cos(4 * TWOPI * z)
+    x1, L1 = L_continuum_matrix(M1, alpha=alpha)
+    x2, L2 = L_continuum_matrix(M2, alpha=alpha)
+    u1 = solve_ivp(lambda t, u: D * np.asarray(L1 @ u).ravel(), (0, T), u0(x1),
+                    method="BDF", rtol=1e-10, atol=1e-12, t_eval=[T]).y[:, -1]
+    u2 = solve_ivp(lambda t, u: D * np.asarray(L2 @ u).ravel(), (0, T), u0(x2),
+                    method="BDF", rtol=1e-10, atol=1e-12, t_eval=[T]).y[:, -1]
+    u1_on_2 = interp_periodic(x1, u1, x2)
+    u_extrap = (2 ** order * u2 - u1_on_2) / (2 ** order - 1)
+    return x2, u_extrap
+
+
+def test8_numerical_reference_accuracy(grids, T=0.04, D=0.02, alpha=0.0):
+    xr, ur = richardson_reference(T, D, alpha=alpha)
+    u0 = lambda z: np.sin(TWOPI * z) + 0.3 * np.cos(4 * TWOPI * z)
+    out = []
+    for M in grids:
+        x, L = L_continuum_matrix(M, alpha=alpha)
+        u = solve_ivp(lambda t, z: D * np.asarray(L @ z).ravel(), (0, T), u0(x),
+                       method="BDF", rtol=1e-9, atol=1e-11, t_eval=[T]).y[:, -1]
+        err = float(np.sqrt(np.mean((u - interp_periodic(xr, ur, x)) ** 2)))
+        out.append(dict(test="numerical_reference_accuracy", alpha=alpha, M=M, error=err))
+    return out
+
+
+# ---------------------------------------------------------------------
+# State-profile comparison: discrete (graph) vs. continuum solution for
+# all four compartments S_h, I_h, S_v, I_v at a large node count
+# ---------------------------------------------------------------------
+def state_profile_comparison(N, eps, T=0.35, Mref=1024, seed=99999, alpha=0.0):
+    p = Par()
+    rng = np.random.default_rng(seed)
+    x = sample_rho(N, rng)
+    P, pi, _ = graph_matrix_sparse(x, eps, alpha=alpha)
+    Lg = L_graph(P, eps)
+    yg = solve_system(x, Lg, T, p)
+    xg, Lc = L_continuum_matrix(Mref, alpha=alpha)
+    yc = solve_system(xg, Lc, T, p, rtol=1e-8, atol=1e-10)
+    return x, yg, xg, yc
+
+
+def make_state_plot(x, yg, xg, yc, out, N, alpha=0.0):
+    labels = ["$S_h$", "$I_h$", "$S_v$", "$I_v$"]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    ax = axes.ravel()
+    for k in range(4):
+        ax[k].plot(xg, yc[k], color="tab:blue", lw=2, label="continuum")
+        ax[k].plot(x, yg[k], color="tab:orange", lw=1, marker=".", ms=3, label="discrete (graph)")
+        ax[k].set_title(labels[k])
+        ax[k].set_xlabel("x")
+        ax[k].set_ylabel(labels[k])
+        ax[k].grid(True)
+        ax[k].legend()
+    fig.suptitle(f"Discrete (N={N}) vs. continuum state profiles, alpha={alpha:g}")
+    fig.tight_layout()
+    fig.savefig(out / f"state_comparison_alpha{alpha:g}.png", dpi=180)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------
+# Acceptance verdict
+# ---------------------------------------------------------------------
+def build_verdict(df, slopes):
+    v = {}
+    alphas = sorted(df.alpha.dropna().unique()) if "alpha" in df else [0.0]
+    for alpha in alphas:
+        suffix = f"_alpha{alpha:g}"
+        t1 = df[(df.test == "graph_construction_conservation") & (df.alpha == alpha)]
+        if len(t1):
+            mean_degree_error = np.abs(
+                t1.mean_degree - TARGET_AVERAGE_DEGREE
+            )
+            v[f"graph_construction_conservation{suffix}"] = dict(
+                passed=bool(
+                    (t1.generator_null_residual < 1e-8).all()
+                    and (t1.row_stochastic_residual < 1e-10).all()
+                    and (mean_degree_error < 1e-12).all()
+                ),
+                target_mean_degree=TARGET_AVERAGE_DEGREE,
+                max_mean_degree_error=float(mean_degree_error.max()),
+                max_generator_null_residual=float(t1.generator_null_residual.max()),
+                max_row_stochastic_residual=float(t1.row_stochastic_residual.max()),
+            )
+        t2 = df[(df.test == "forward_backward_equivalence") & (df.alpha == alpha)]
+        if len(t2):
+            v[f"forward_backward_equivalence{suffix}"] = dict(
+                passed=bool((t2.detailed_balance_residual < 1e-8).all() and (t2.forward_backward_relative < 1e-6).all()),
+                max_detailed_balance_residual=float(t2.detailed_balance_residual.max()),
+                max_forward_backward_relative=float(t2.forward_backward_relative.max()),
+            )
+        for name, thresh in [("operator_consistency", -0.3), ("pure_transport", -0.3), ("full_nonlinear", -0.2)]:
+            key = f"{name}{suffix}"
+            if key in slopes:
+                v[key] = dict(passed=bool(slopes[key]["slope"] <= thresh), slope=slopes[key]["slope"], r2=slopes[key]["r2"])
+        bw = df[(df.test == "bandwidth_robustness") & (df.alpha == alpha)]
+        if len(bw):
+            g = bw.groupby("factor").error.mean()
+            ratio = float(g.max() / max(g.min(), 1e-15))
+            v[f"bandwidth_robustness{suffix}"] = dict(passed=bool(ratio < 5.0), max_min_ratio=ratio)
+        sv = df[(df.test == "stochastic_variability") & (df.alpha == alpha)]
+        if len(sv):
+            rel = float((sv["std"] / sv["mean"]).max())
+            v[f"stochastic_variability{suffix}"] = dict(passed=bool(rel < 1.0), max_relative_std=rel)
+        key = f"numerical_reference_accuracy{suffix}"
+        if key in slopes:
+            s = slopes[key]["slope"]
+            v[key] = dict(passed=bool(abs(s - (-2.0)) < 0.75), slope=s)
+    return v
+
+
+def make_plots(df, out):
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    ax = axes.ravel()
+
+    for name, label, idx in [
+        ("operator_consistency", "operator consistency", 0),
+        ("pure_transport", "pure transport", 1),
+        ("full_nonlinear", "full nonlinear", 2),
+    ]:
+        subset = df[df.test == name]
+        for alpha in sorted(subset.alpha.dropna().unique()):
+            z = subset[subset.alpha == alpha].groupby("N").error.mean()
+            if len(z):
+                ax[idx].loglog(z.index, z.values, "o-", label=f"alpha={alpha:g}")
+        if len(subset):
+            ax[idx].legend()
+        ax[idx].set_title(label); ax[idx].set_xlabel("N"); ax[idx].set_ylabel("weighted L2 error")
+        ax[idx].grid(True, which="both")
+
+    bw = df[df.test == "bandwidth_robustness"]
+    if len(bw):
+        for alpha, subset in bw.groupby("alpha"):
+            g = subset.groupby("factor").error.agg(["mean", "std"])
+            ax[3].errorbar(g.index, g["mean"], yerr=g["std"].fillna(0), marker="o", label=f"alpha={alpha:g}")
+        ax[3].legend()
+    ax[3].set_title("bandwidth robustness"); ax[3].set_xlabel("bandwidth factor"); ax[3].set_ylabel("operator error")
+    ax[3].grid(True)
+
+    ref = df[df.test == "numerical_reference_accuracy"]
+    if len(ref):
+        for alpha, subset in ref.groupby("alpha"):
+            z = subset.groupby("M").error.mean()
+            ax[4].loglog(z.index, z.values, "o-", label=f"alpha={alpha:g}")
+        ax[4].legend()
+    ax[4].set_title("numerical reference accuracy"); ax[4].set_xlabel("M"); ax[4].set_ylabel("RMS error")
+    ax[4].grid(True, which="both")
+
+    sv = df[df.test == "stochastic_variability"]
+    if len(sv):
+        for alpha, subset in sv.groupby("alpha"):
+            ax[5].errorbar(subset.N, subset["mean"], yerr=subset["ci95"], marker="o", label=f"alpha={alpha:g}")
+        ax[5].legend()
+        ax[5].set_xscale("log"); ax[5].set_yscale("log")
+    ax[5].set_title("stochastic variability (95% CI)"); ax[5].set_xlabel("N"); ax[5].set_ylabel("operator error")
+    ax[5].grid(True, which="both")
+
+    t1 = df[df.test == "graph_construction_conservation"]
+    if len(t1):
+        for alpha, subset in t1.groupby("alpha"):
+            ax[6].semilogx(subset.N, subset.generator_null_residual, "o-", label=f"null, alpha={alpha:g}")
+            ax[6].semilogx(subset.N, subset.row_stochastic_residual, "s-", label=f"stochastic, alpha={alpha:g}")
+        ax[6].set_yscale("log"); ax[6].legend()
+    ax[6].set_title("graph construction conservation"); ax[6].set_xlabel("N"); ax[6].set_ylabel("residual")
+    ax[6].grid(True)
+
+    t2 = df[df.test == "forward_backward_equivalence"]
+    if len(t2):
+        for alpha, subset in t2.groupby("alpha"):
+            ax[7].semilogx(subset.N, subset.detailed_balance_residual, "o-", label=f"balance, alpha={alpha:g}")
+            ax[7].semilogx(subset.N, subset.forward_backward_relative, "s-", label=f"forward-backward, alpha={alpha:g}")
+        ax[7].set_yscale("log"); ax[7].legend()
+    ax[7].set_title("forward-backward equivalence"); ax[7].set_xlabel("N"); ax[7].set_ylabel("residual")
+    ax[7].grid(True)
+
+    fig.tight_layout()
+    fig.savefig(out / "convergence.png", dpi=180)
+    plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["quick", "full"], default="quick")
+    ap.add_argument("--out", default="convergence_results_upgraded")
+    ap.add_argument("--eps-exponent", type=float, default=0.55)
+    ap.add_argument("--eps-const", type=float, default=0.18)
+    ap.add_argument("--kernel-tol", type=float, default=1e-13)
+    ap.add_argument("--alphas", type=float, nargs="+", default=[0.0, 0.5, 1.0],
+                    help="Density-normalization exponents to compare.")
+    ap.add_argument("--N-state", type=int, default=2000, help="Node count used for the four-panel state comparison plot.")
+    a = ap.parse_args()
+
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+
+    if a.mode == "quick":
+        Ns = [50, 250, 500, 750, 1000, 1250, 1500, 1750, 2000]; reps = 5; Mref_small = 512; mesh_grids = (64, 128, 256)
+    else:
+        Ns = [50, 250, 500, 750, 1000, 1250, 1500, 1750, 2000]; reps = 15; Mref_small = 1024; mesh_grids = (64, 128, 256, 512)
+
+    eps_of = lambda N: a.eps_const * N ** (-a.eps_exponent)
+
+    rows = []
+    for alpha in a.alphas:
+        for N in Ns:
+            eps = eps_of(N)
+            rows.append(test1_graph_construction_conservation(N, eps, 1000 + N, alpha=alpha))
+            rows.append(test2_forward_backward_equivalence(N, eps, 2000 + N, alpha=alpha))
+            op_errors = []
+            for r in range(reps):
+                row = test3_operator_consistency(N, eps, 3000 + 31 * N + r, alpha=alpha)
+                rows.append(row)
+                op_errors.append(row["error"])
+            variability = test7_stochastic_variability_from_errors(N, eps, op_errors)
+            variability["alpha"] = alpha
+            rows.append(variability)
+            rows.append(test4_pure_transport_convergence(N, eps, 4000 + N, Mref=Mref_small, alpha=alpha))
+            rows.append(test5_full_nonlinear_convergence(N, eps, 5000 + N, Mref=Mref_small, alpha=alpha))
+
+        N_big = Ns[-1]
+        eps_big = eps_of(N_big)
+        for factor in [0.0005, 0.005, 0.05, 0.25, 0.50, 0.75, 1.0]:
+            for r in range(reps):
+                row = test6_bandwidth_robustness(
+                    N_big, factor * eps_big, 6000 + r, alpha=alpha
+                )
+                row["factor"] = factor
+                rows.append(row)
+
+        rows += test8_numerical_reference_accuracy(mesh_grids, alpha=alpha)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out / "all_results.csv", index=False)
+
+    eps_state = eps_of(a.N_state)
+    for alpha in a.alphas:
+        x_state, yg_state, xg_state, yc_state = state_profile_comparison(
+            a.N_state, eps_state, Mref=Mref_small, alpha=alpha
+        )
+        make_state_plot(
+            x_state, yg_state, xg_state, yc_state, out, a.N_state, alpha=alpha
+        )
+
+    sv_summary = df[df.test == "stochastic_variability"][["alpha", "N", "eps", "reps", "mean", "std", "ci95"]]
+    sv_summary.to_csv(out / "stochastic_variability.csv", index=False)
+
+    slopes = {}
+    for alpha in a.alphas:
+        suffix = f"_alpha{alpha:g}"
+        for name in ["operator_consistency", "pure_transport", "full_nonlinear"]:
+            z = df[(df.test == name) & (df.alpha == alpha)].groupby("N").error.mean().reset_index()
+            if len(z) > 1:
+                slopes[f"{name}{suffix}"] = loglog_regression(z.N, z.error)
+        z8 = df[(df.test == "numerical_reference_accuracy") & (df.alpha == alpha)].groupby("M").error.mean().reset_index()
+        if len(z8) > 1:
+            slopes[f"numerical_reference_accuracy{suffix}"] = loglog_regression(z8.M, z8.error)
+
+    verdict = build_verdict(df, slopes)
+    (out / "summary.json").write_text(json.dumps(dict(mode=a.mode, runtime_s=time.time() - t0, slopes=slopes), indent=2))
+    (out / "verdict.json").write_text(json.dumps(verdict, indent=2))
+
+    make_plots(df, out)
+
+    print(json.dumps(dict(
+        output=str(out),
+        slopes={k: v["slope"] for k, v in slopes.items()},
+        verdict={k: v["passed"] for k, v in verdict.items()},
+    ), indent=2))
+
+
+if __name__ == "__main__":
+    main()
